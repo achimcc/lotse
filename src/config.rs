@@ -31,6 +31,8 @@ pub struct Class {
     pub exclusive_with: Vec<String>,
     /// Command lines that are a run of this class even if nobody registered it.
     pub observe: Vec<Regex>,
+    /// Command lines that match `observe` and are still not of this class.
+    pub ignore: Vec<Regex>,
     pub retry: Option<Retry>,
     pub max_wait: Option<Duration>,
 }
@@ -64,6 +66,8 @@ struct RawClass {
     exclusive_with: Vec<String>,
     #[serde(default)]
     observe: Vec<String>,
+    #[serde(default)]
+    ignore: Vec<String>,
     retry: Option<RawRetry>,
     max_wait: Option<String>,
 }
@@ -121,6 +125,7 @@ impl Config {
                     per_target: c.per_target,
                     exclusive_with: c.exclusive_with.clone(),
                     observe: patterns(&c.observe, &format!("class {name}, observe"))?,
+                    ignore: patterns(&c.ignore, &format!("class {name}, ignore"))?,
                     retry,
                     max_wait: c.max_wait.as_deref().map(parse_duration).transpose()?,
                 },

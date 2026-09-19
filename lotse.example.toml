@@ -1,0 +1,32 @@
+# lotse.toml: found upwards from the current directory, so it lives in the
+# repository whose runs it describes. An unknown key is an error.
+
+# Memory that stays free whatever is admitted.
+reserve = "4G"
+# How long `run` queues and `wait` blocks before giving up with exit code 200.
+max_wait = "30m"
+
+# A full NixOS evaluation: about ten gigabytes each, and three of them fill
+# this machine. MEASURE your own estimate: run one, read RSS in `lotse status`.
+[class.eval]
+memory = "10G"
+slots = 3
+# Runs nobody registered still count. The pattern is matched against the
+# command line, joined by spaces.
+observe = ['\bnix (build|eval)\b.*nixosConfigurations', '\bcolmena (build|apply\b.* (build|dry-activate))\b']
+# Retried only if the run FAILED and one of these stood in its output.
+retry = { patterns = ['Could not resolve host', 'unable to download', 'daemon disconnected'], times = 3, pause = "30s" }
+
+# One deploy per machine. No retry: what acts on the outside world is not
+# repeated by a machine.
+[class.deploy]
+per_target = true
+slots = 1
+observe = ['\bcolmena apply\b']
+# `colmena apply build` builds and activates nothing: an eval, not a deploy.
+ignore = ['\bcolmena apply\b.* (build|dry-activate)\b']
+
+# Something that must have the tree to itself.
+[class.exclusive-tests]
+slots = 1
+exclusive_with = ["eval"]

@@ -183,10 +183,27 @@ pub fn target_from_argv(argv: &[String]) -> Option<String> {
     None
 }
 
-fn is_lotse(p: &Proc) -> bool {
+fn program(p: &Proc) -> &str {
     p.argv
         .first()
-        .is_some_and(|a| a.rsplit('/').next() == Some("lotse"))
+        .and_then(|a| a.rsplit('/').next())
+        .unwrap_or("")
+}
+
+fn is_lotse(p: &Proc) -> bool {
+    program(p) == "lotse"
+}
+
+/// A shell is never the run itself. Its command line is a script that may
+/// merely MENTION a build: a loop that waits for one, a `pgrep` for one.
+/// Such a shell once sat here for 26 hours, waiting for a pattern that
+/// matched its own command line. The program that does the work is matched
+/// on its own.
+fn is_shell(p: &Proc) -> bool {
+    matches!(
+        program(p),
+        "sh" | "bash" | "dash" | "zsh" | "ksh" | "fish" | "nu"
+    )
 }
 
 /// Runs that match a class but that no lotse accounts for.
@@ -196,12 +213,14 @@ pub fn observe(cfg: &Config, table: &ProcTable, registered: &[u32]) -> Vec<Obser
     let registered: BTreeSet<u32> = registered.iter().copied().collect();
     let mut hits: Vec<(u32, &str)> = Vec::new();
     for p in table.by_pid.values() {
-        if is_lotse(p) {
+        if is_lotse(p) || is_shell(p) {
             continue;
         }
         let line = p.argv.join(" ");
         for (name, class) in &cfg.classes {
-            if class.observe.iter().any(|re| re.is_match(&line)) {
+            if class.observe.iter().any(|re| re.is_match(&line))
+                && !class.ignore.iter().any(|re| re.is_match(&line))
+            {
                 hits.push((p.pid, name));
             }
         }
@@ -298,11 +317,63 @@ mod tests {
 
     #[test]
     fn only_the_root_of_a_chain_counts_and_carries_the_tree() {
-        let shell = ["sh", "-c", "nix build .#nixosConfigurations.server.x"];
-        let t = ProcTable::new(vec![p(9, 1, 2, &shell), p(10, 9, 5, NIX)]);
+        let wrapper = [
+            "timeout",
+            "600",
+            "nix",
+            "build",
+            ".#nixosConfigurations.server.x",
+        ];
+        let t = ProcTable::new(vec![p(9, 1, 2, &wrapper), p(10, 9, 5, NIX)]);
         let o = observe(&cfg(), &t, &[]);
         assert_eq!(o.len(), 1);
         assert_eq!((o[0].pid, o[0].rss_tree), (9, 7));
+    }
+
+    #[test]
+    fn a_shell_that_mentions_a_build_is_not_one() {
+        let waiting = [
+            "/nix/store/x-bash-5.3/bin/bash",
+            "-c",
+            "while pgrep -f 'nix eval .#nixosConfigurations.server'; do sleep 10; done",
+        ];
+        let t = ProcTable::new(vec![p(9, 1, 2, &waiting), p(10, 9, 1, &["sleep", "10"])]);
+        assert!(observe(&cfg(), &t, &[]).is_empty());
+        // The build below a shell still counts, as itself.
+        let t = ProcTable::new(vec![p(9, 1, 2, &waiting), p(10, 9, 5, NIX)]);
+        let o = observe(&cfg(), &t, &[]);
+        assert_eq!((o.len(), o[0].pid, o[0].rss_tree), (1, 10, 5));
+    }
+
+    #[test]
+    fn ignore_takes_a_command_line_out_of_a_class() {
+        let cfg = Config::parse(
+            r#"
+            [class.deploy]
+            observe = ['\bcolmena apply\b']
+            ignore = ['\bcolmena apply\b.* (build|dry-activate)\b']
+            "#,
+        )
+        .unwrap();
+        let t = ProcTable::new(vec![
+            p(
+                10,
+                1,
+                1,
+                &[
+                    "colmena",
+                    "apply",
+                    "--on",
+                    "server",
+                    "build",
+                    "--keep-result",
+                ],
+            ),
+            p(11, 1, 1, &["colmena", "apply", "--on", "vps", "switch"]),
+        ]);
+        let o = observe(&cfg, &t, &[]);
+        assert_eq!(o.len(), 1);
+        assert_eq!(o[0].target.as_deref(), Some("vps"));
     }
 
     #[test]
