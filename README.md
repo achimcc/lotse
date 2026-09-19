@@ -66,6 +66,7 @@ typo in a limit must not silently select the default.
 | `reserve` | memory that stays free whatever is admitted |
 | `max_wait` | how long `run` queues and `wait` blocks (default `30m`); also per class |
 | `class.X.memory` | what one run of the class grows to; without it the class is not budgeted |
+| `class.X.grows_for` | after this long a run has reached its size and claims nothing more; without it, it always counts with its whole estimate |
 | `class.X.slots` | how many at once; without it only the memory budget limits |
 | `class.X.per_target` | slots and queue count per `--target` |
 | `class.X.exclusive_with` | classes that must not run at the same time, in both directions |
@@ -92,7 +93,10 @@ Decided under a short global lock, in this order:
    ```
 
    A run that has just started is small but will grow to its estimate; one
-   that has grown is already missing from `MemAvailable`. Counting both as
+   that has grown is already missing from `MemAvailable`. With `grows_for`,
+   a run older than that is taken at its present size: a `nix build` whose
+   evaluation is over and that only waits for the builders is small and
+   will stay so. Counting both as
    "one slot" is what fills a machine.
 
    If the budget says no while nothing at all is under way, the run starts
@@ -128,6 +132,9 @@ classes' `observe` patterns. Not counted:
   may merely mention a build: a loop that waits for one, a `pgrep` for one.
   The program that does the work matches on its own. A shell running a
   script file is a program like any other.
+
+Anchor the patterns at the program (`^(\S*/)?nix build\b…`). Unanchored,
+`pgrep -f "nix eval …"` is an evaluation as well.
 
 The target of an observed run is what follows `--on`.
 
@@ -178,7 +185,7 @@ are not.
 ## Install
 
 ```nix
-inputs.lotse.url = "github:achimcc/lotse/v0.1.1";
+inputs.lotse.url = "github:achimcc/lotse/v0.1.2";
 # devShell or systemPackages:
 inputs.lotse.packages.${system}.default
 ```

@@ -24,6 +24,11 @@ pub struct Config {
 pub struct Class {
     /// What one run of this class is expected to grow to. Zero: not budgeted.
     pub memory: u64,
+    /// For how long after its start a run still grows towards `memory`.
+    /// After that its resident set is taken as final: an evaluation that
+    /// has long finished and only waits for the builders claims nothing
+    /// any more. `None`: it always counts with its whole estimate.
+    pub grows_for: Option<Duration>,
     /// `None`: as many as the memory budget allows.
     pub slots: Option<u32>,
     /// Slots and queue count per `--target` instead of per class.
@@ -59,6 +64,7 @@ struct RawConfig {
 #[serde(deny_unknown_fields)]
 struct RawClass {
     memory: Option<String>,
+    grows_for: Option<String>,
     slots: Option<u32>,
     #[serde(default)]
     per_target: bool,
@@ -121,6 +127,7 @@ impl Config {
                         .map(parse_size)
                         .transpose()?
                         .unwrap_or(0),
+                    grows_for: c.grows_for.as_deref().map(parse_duration).transpose()?,
                     slots: c.slots,
                     per_target: c.per_target,
                     exclusive_with: c.exclusive_with.clone(),
@@ -196,6 +203,7 @@ max_wait = "30m"
 
 [class.eval]
 memory = "10G"
+grows_for = "5m"
 slots = 3
 observe = ['\bnix (build|eval)\b.*nixosConfigurations', '\bcolmena build\b']
 retry = { patterns = ['Could not resolve host', 'unable to download', 'daemon disconnected'], times = 3, pause = "30s" }

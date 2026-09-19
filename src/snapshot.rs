@@ -64,7 +64,7 @@ impl Snapshot {
         e.child_pid.map_or(0, |pid| self.table.tree_rss(pid))
     }
 
-    pub fn active(&self) -> Vec<Active> {
+    pub fn active(&self, now: u64) -> Vec<Active> {
         let running = self
             .entries
             .iter()
@@ -73,12 +73,14 @@ impl Snapshot {
                 class: e.class.clone(),
                 target: e.target.clone(),
                 rss_tree: self.entry_rss(e),
+                age: now.saturating_sub(e.started.unwrap_or(e.created)),
                 label: label(&e.class, e.target.as_deref(), Some(&e.cwd), e.pid),
             });
         let observed = self.observed.iter().map(|o| Active {
             class: o.class.clone(),
             target: o.target.clone(),
             rss_tree: o.rss_tree,
+            age: now.saturating_sub(o.start),
             label: format!(
                 "{}, not registered",
                 label(&o.class, o.target.as_deref(), o.cwd.as_deref(), o.pid)
@@ -103,7 +105,7 @@ impl Snapshot {
     /// Who is under way in this class (and on this target)? A waiting run is
     /// not: it has not touched anything yet.
     pub fn busy(&self, class: &str, target: Option<&str>) -> Vec<String> {
-        self.active()
+        self.active(crate::state::now())
             .into_iter()
             .filter(|a| a.class == class)
             .filter(|a| target.is_none() || targets_conflict(target, a.target.as_deref()))

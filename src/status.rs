@@ -60,15 +60,8 @@ fn rows(snap: &Snapshot, now: u64) -> Vec<Row> {
     out
 }
 
-fn pending_growth(cfg: &Config, snap: &Snapshot) -> u64 {
-    snap.active()
-        .iter()
-        .map(|a| {
-            cfg.classes
-                .get(&a.class)
-                .map_or(0, |c| c.memory.saturating_sub(a.rss_tree))
-        })
-        .sum()
+fn pending_growth(cfg: &Config, snap: &Snapshot, now: u64) -> u64 {
+    snap.active(now).iter().map(|a| a.pending(cfg)).sum()
 }
 
 pub fn render_json(cfg: &Config, snap: &Snapshot, now: u64) -> Value {
@@ -92,7 +85,7 @@ pub fn render_json(cfg: &Config, snap: &Snapshot, now: u64) -> Value {
     json!({
         "mem_available": snap.mem_available,
         "reserve": cfg.reserve,
-        "pending_growth": pending_growth(cfg, snap),
+        "pending_growth": pending_growth(cfg, snap, now),
         "runs": runs,
     })
 }
@@ -143,7 +136,7 @@ pub fn render_text(cfg: &Config, snap: &Snapshot, now: u64) -> String {
         "memory: {} available, {} reserve, {} still to be claimed by running jobs\n",
         format_size(snap.mem_available),
         format_size(cfg.reserve),
-        format_size(pending_growth(cfg, snap)),
+        format_size(pending_growth(cfg, snap, now)),
     ));
     out
 }
@@ -167,7 +160,7 @@ mod tests {
             cwd: "/x/.claude/worktrees/wt".into(),
             command: vec!["nix".into()],
             state,
-            created: 90,
+            created: 99,
             started: None,
             log: None,
         };

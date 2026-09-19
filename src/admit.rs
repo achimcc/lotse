@@ -16,7 +16,22 @@ pub struct Active {
     pub target: Option<String>,
     /// Resident set of the whole process tree, bytes.
     pub rss_tree: u64,
+    /// Seconds since it started.
+    pub age: u64,
     pub label: String,
+}
+
+impl Active {
+    /// What this run will still take out of `MemAvailable`.
+    pub fn pending(&self, cfg: &Config) -> u64 {
+        let Some(class) = cfg.classes.get(&self.class) else {
+            return 0;
+        };
+        if class.grows_for.is_some_and(|g| self.age >= g.as_secs()) {
+            return 0;
+        }
+        class.memory.saturating_sub(self.rss_tree)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -128,14 +143,7 @@ pub fn decide(
     if class.memory > 0 {
         // A run that has just started is still small but will grow to its
         // estimate; one that has grown is already missing from MemAvailable.
-        let pending: u64 = active
-            .iter()
-            .map(|a| {
-                cfg.classes
-                    .get(&a.class)
-                    .map_or(0, |c| c.memory.saturating_sub(a.rss_tree))
-            })
-            .sum();
+        let pending: u64 = active.iter().map(|a| a.pending(cfg)).sum();
         let have = mem_available.saturating_sub(pending);
         let need = class.memory + cfg.reserve;
         if need > have {
@@ -173,6 +181,7 @@ mod tests {
             class: class.into(),
             target: target.map(Into::into),
             rss_tree: rss,
+            age: 10,
             label: format!("{class} {}", target.unwrap_or("-")),
         }
     }
@@ -289,6 +298,17 @@ mod tests {
     fn a_grown_run_is_already_in_mem_available() {
         let grown = [active("eval", None, 10 * G)];
         assert_eq!(decide(&cfg(), &cand("eval", None), &grown, &[], 20 * G), OK);
+    }
+
+    #[test]
+    fn a_run_past_its_growth_claims_nothing_more() {
+        // Small and old: the evaluation is over, it waits for the builders.
+        let mut settled = active("eval", None, G / 32);
+        settled.age = 16 * 60;
+        assert_eq!(
+            decide(&cfg(), &cand("eval", None), &[settled], &[], 20 * G),
+            OK
+        );
     }
 
     #[test]

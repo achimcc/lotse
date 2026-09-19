@@ -206,7 +206,7 @@ fn queue_up(
             let decision = decide(
                 cfg,
                 &cand,
-                &snap.active(),
+                &snap.active(now()),
                 &snap.queued(entry.entry.seq),
                 snap.mem_available,
             );

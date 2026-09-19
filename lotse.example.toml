@@ -10,10 +10,15 @@ max_wait = "30m"
 # this machine. MEASURE your own estimate: run one, read RSS in `lotse status`.
 [class.eval]
 memory = "10G"
+# It has reached its size after this long. Without it, a `nix build` whose
+# evaluation is long over and that only waits for the builders would claim
+# its whole estimate for as long as it lives.
+grows_for = "5m"
 slots = 3
 # Runs nobody registered still count. The pattern is matched against the
-# command line, joined by spaces.
-observe = ['\bnix (build|eval)\b.*nixosConfigurations', '\bcolmena (build|apply\b.* (build|dry-activate))\b']
+# command line, joined by spaces. ANCHOR it at the program: unanchored, the
+# `pgrep -f "nix eval …"` of somebody's waiting loop is an evaluation too.
+observe = ['^(\S*/)?nix (build|eval)\b.*nixosConfigurations', '^(\S*/)?colmena (build|apply\b.* (build|dry-activate))\b']
 # Retried only if the run FAILED and one of these stood in its output.
 retry = { patterns = ['Could not resolve host', 'unable to download', 'daemon disconnected'], times = 3, pause = "30s" }
 
@@ -22,7 +27,7 @@ retry = { patterns = ['Could not resolve host', 'unable to download', 'daemon di
 [class.deploy]
 per_target = true
 slots = 1
-observe = ['\bcolmena apply\b']
+observe = ['^(\S*/)?colmena apply\b']
 # `colmena apply build` builds and activates nothing: an eval, not a deploy.
 ignore = ['\bcolmena apply\b.* (build|dry-activate)\b']
 
