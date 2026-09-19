@@ -21,12 +21,16 @@ USAGE:
   lotse [--config FILE] run --class CLASS [--target T] [--max-wait D] [--no-retry] -- COMMAND…
   lotse [--config FILE] status [--json]
   lotse [--config FILE] wait CLASS [--target T] [--max-wait D]
+  lotse hook claude
 
 run     waits for a slot of CLASS, runs COMMAND, copies its output into a log,
         retries it if it failed with one of the class's network patterns, and
         exits with COMMAND's exit code.
 status  lists what runs and what waits, registered or merely observed.
 wait    blocks until no run of CLASS (on target T) is under way.
+hook    a PreToolUse hook for Claude Code: reads the event on stdin and puts
+        `lotse run --class=…` in front of commands of classes with `wrap = true`.
+        Never fails the tool call: what it cannot do, it leaves alone.
 
 Durations take a unit: 90s, 30m, 2h. The configuration is the nearest
 lotse.toml upwards from the current directory, else
@@ -166,7 +170,50 @@ fn real_main() -> Result<i32> {
     }
 }
 
+/// The hook must never stand between a session and its tool call: whatever
+/// goes wrong here ends in silence and exit code 0, which leaves the call as
+/// it was.
+fn hook_main() {
+    use std::io::Read;
+    let mut raw = String::new();
+    if std::io::stdin().read_to_string(&mut raw).is_err() {
+        return;
+    }
+    let Ok(event) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return;
+    };
+    let cwd = event["cwd"]
+        .as_str()
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_dir().ok());
+    let Some(cwd) = cwd else { return };
+    let cfg = match Config::load(None, &cwd) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            // No lotse.toml here: not a repository that wants this.
+            if Config::find(&cwd).is_some() {
+                eprintln!("lotse hook: {e:#}");
+            }
+            return;
+        }
+    };
+    // Not even a bug in the scanner may cost the session its tool call.
+    let out = std::panic::catch_unwind(|| lotse::hook::claude_pre_tool_use(&cfg, &event));
+    if let Ok(Some(out)) = out {
+        println!("{out}");
+    }
+}
+
 fn main() -> ExitCode {
+    let mut args = std::env::args().skip(1);
+    if args.next().as_deref() == Some("hook") {
+        if args.next().as_deref() != Some("claude") {
+            eprintln!("lotse: usage: lotse hook claude < event.json");
+            return ExitCode::from(EXIT_USAGE as u8);
+        }
+        hook_main();
+        return ExitCode::SUCCESS;
+    }
     match real_main() {
         // 200 and 201 do not fit an i8, but they do fit the u8 the kernel keeps.
         Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),

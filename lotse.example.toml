@@ -15,10 +15,16 @@ memory = "10G"
 # its whole estimate for as long as it lives.
 grows_for = "5m"
 slots = 3
+# `lotse hook claude` puts `lotse run --class=eval --` in front of these.
+wrap = true
 # Runs nobody registered still count. The pattern is matched against the
 # command line, joined by spaces. ANCHOR it at the program: unanchored, the
 # `pgrep -f "nix eval …"` of somebody's waiting loop is an evaluation too.
-observe = ['^(\S*/)?nix (build|eval)\b.*nixosConfigurations', '^(\S*/)?colmena (build|apply\b.* (build|dry-activate))\b']
+observe = [
+  '^(\S*/)?nix (build|eval)\b.*nixosConfigurations',
+  '^(\S*/)?nix flake check\b',
+  '^(\S*/)?colmena (build|apply\b.* (build|dry-activate))\b',
+]
 # Retried only if the run FAILED and one of these stood in its output.
 retry = { patterns = ['Could not resolve host', 'unable to download', 'daemon disconnected'], times = 3, pause = "30s" }
 

@@ -3,6 +3,7 @@
 
 pub mod admit;
 pub mod config;
+pub mod hook;
 pub mod proc;
 pub mod run;
 pub mod snapshot;

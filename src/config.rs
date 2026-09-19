@@ -38,6 +38,8 @@ pub struct Class {
     pub observe: Vec<Regex>,
     /// Command lines that match `observe` and are still not of this class.
     pub ignore: Vec<Regex>,
+    /// `lotse hook` puts `lotse run` in front of commands of this class.
+    pub wrap: bool,
     pub retry: Option<Retry>,
     pub max_wait: Option<Duration>,
 }
@@ -74,6 +76,8 @@ struct RawClass {
     observe: Vec<String>,
     #[serde(default)]
     ignore: Vec<String>,
+    #[serde(default)]
+    wrap: bool,
     retry: Option<RawRetry>,
     max_wait: Option<String>,
 }
@@ -133,6 +137,7 @@ impl Config {
                     exclusive_with: c.exclusive_with.clone(),
                     observe: patterns(&c.observe, &format!("class {name}, observe"))?,
                     ignore: patterns(&c.ignore, &format!("class {name}, ignore"))?,
+                    wrap: c.wrap,
                     retry,
                     max_wait: c.max_wait.as_deref().map(parse_duration).transpose()?,
                 },

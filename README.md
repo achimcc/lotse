@@ -72,6 +72,7 @@ typo in a limit must not silently select the default.
 | `class.X.exclusive_with` | classes that must not run at the same time, in both directions |
 | `class.X.observe` | command lines that are a run of this class even unregistered |
 | `class.X.ignore` | command lines that match `observe` and still are not |
+| `class.X.wrap` | `lotse hook claude` puts `lotse run` in front of commands of this class |
 | `class.X.retry` | `{ patterns, times, pause }`, see below |
 
 Sizes take `K`, `M`, `G` (powers of two), durations `s`, `m`, `h`.
@@ -152,6 +153,40 @@ is held across the pause.
 A class without `retry` is never repeated. Give none to anything that acts on
 the outside world.
 
+## A hook for Claude Code
+
+A rule in a `CLAUDE.md` is a thing to remember, and a dozen sessions forget
+it a dozen times. `lotse hook claude` is a `PreToolUse` hook that makes it a
+property of the tool call: it puts `lotse run --class=… --` in front of every
+command of a class with `wrap = true`.
+
+```json
+{ "hooks": { "PreToolUse": [ { "matcher": "Bash",
+    "hooks": [ { "type": "command", "command": "lotse hook claude", "timeout": 10 } ] } ] } }
+```
+
+```
+cd /x && nix flake check 2>&1 | tail -3
+cd /x && lotse run --class=eval -- nix flake check 2>&1 | tail -3
+```
+
+It rewrites a command only where the shell would run it: at the start, after
+`;`, `&&`, `||`, `|`, `&`, in `( … )` and `$( … )`, after variable assignments
+and keywords like `if` and `then`. Text that merely mentions a build —
+`echo "nix flake check"`, `pgrep -f 'nix eval …'`, `ssh host 'nix build …'`, a
+comment, a commit message — is not a command and stays.
+
+**What it does not follow, it does not touch:** a here-document (its body is
+data), backticks, `$(( … ))`, unbalanced quotes. The whole call then runs as
+it was written — unqueued, but observed like any other. It returns no
+`permissionDecision`: the rewritten command goes through the same permission
+flow as every other. It queues, it does not approve. Without a `lotse.toml`
+upwards from the session's directory it does nothing, and whatever goes wrong
+inside it ends in silence and exit code 0.
+
+The wrapper is written as `--class=eval`, one word: a sandbox in front of the
+shell may refuse a bare `eval`.
+
 ## Signals
 
 `SIGINT`, `SIGTERM` and `SIGHUP` are passed on. Without a terminal on stdin
@@ -185,7 +220,7 @@ are not.
 ## Install
 
 ```nix
-inputs.lotse.url = "github:achimcc/lotse/v0.1.2";
+inputs.lotse.url = "github:achimcc/lotse/v0.2.0";
 # devShell or systemPackages:
 inputs.lotse.packages.${system}.default
 ```
