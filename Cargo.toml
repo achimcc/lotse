@@ -1,0 +1,26 @@
+[package]
+name = "lotse"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+description = "Queue, admit and retry the heavy runs of parallel sessions on one workstation"
+repository = "https://github.com/achimcc/lotse"
+readme = "README.md"
+keywords = ["nix", "queue", "semaphore", "cli"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+anyhow = "1"
+lexopt = "0.3"
+regex = "1"
+rustix = { version = "1", features = ["fs", "process", "param"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+signal-hook = "0.3"
+toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = true
