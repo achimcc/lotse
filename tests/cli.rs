@@ -182,6 +182,29 @@ fn usage_errors_are_2() {
 }
 
 #[test]
+fn a_run_below_a_run_does_not_queue_behind_its_parent() {
+    // The only slot of `one` is held by the outer run; the inner one must
+    // not wait for it.
+    let env = Env::new();
+    let me = env!("CARGO_BIN_EXE_lotse");
+    let config = env.path("lotse.toml");
+    let inner = format!(
+        "{me} --config {} run --class one --max-wait 2s -- sh -c 'exit 9'",
+        config.display()
+    );
+    let begun = Instant::now();
+    assert_eq!(
+        env.code(&["run", "--class", "one", "--", "sh", "-c", &inner]),
+        9
+    );
+    assert!(
+        begun.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        begun.elapsed()
+    );
+}
+
+#[test]
 fn the_wait_limit_is_200() {
     let env = Env::new();
     let mut holder = env.spawn(&["run", "--class", "one", "--", "sleep", "20"]);

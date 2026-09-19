@@ -107,6 +107,11 @@ Decided under a short global lock, in this order:
 A run without `--target` in a `per_target` class meets every target: a deploy
 that does not say where it goes may go anywhere.
 
+A `lotse run` below a `lotse run` — a recipe that queues its build, called
+from a command that was queued already — does not queue again: it is part of
+the outer run and would otherwise wait for the memory the outer one has
+claimed for exactly this work.
+
 ## Liveness
 
 Each `lotse run` holds an `flock` on its entry for as long as it lives. An
@@ -220,7 +225,7 @@ are not.
 ## Install
 
 ```nix
-inputs.lotse.url = "github:achimcc/lotse/v0.2.0";
+inputs.lotse.url = "github:achimcc/lotse/v0.2.1";
 # devShell or systemPackages:
 inputs.lotse.packages.${system}.default
 ```

@@ -284,7 +284,33 @@ fn supervise(child: &mut Child, own_group: bool, signals: &Signals) -> Result<At
     }
 }
 
+/// Set for everything a `lotse run` starts.
+pub const NESTED: &str = "LOTSE_RUN";
+
+/// A `lotse run` below a `lotse run`: a recipe that queues its build, called
+/// from a command that was queued already. The inner one would wait for the
+/// memory the outer one has claimed for exactly this work, until the wait
+/// limit. It is part of the outer run, so it just runs.
+fn run_nested(args: &RunArgs) -> Result<i32> {
+    let status = match Command::new(&args.command[0])
+        .args(&args.command[1..])
+        .status()
+    {
+        Ok(status) => status,
+        Err(e) => {
+            eprintln!("lotse: cannot start {:?}: {e}", args.command[0]);
+            return Ok(127);
+        }
+    };
+    Ok(status
+        .code()
+        .unwrap_or_else(|| 128 + status.signal().unwrap_or(0)))
+}
+
 pub fn run(cfg: &Config, state: &StateDir, src: &dyn ProcSource, args: RunArgs) -> Result<i32> {
+    if std::env::var_os(NESTED).is_some() {
+        return run_nested(&args);
+    }
     let class = &cfg.classes[&args.class];
     let max_wait = args.max_wait.or(class.max_wait).unwrap_or(cfg.max_wait);
     let cwd = std::env::current_dir().context("no current directory")?;
@@ -329,6 +355,7 @@ pub fn run(cfg: &Config, state: &StateDir, src: &dyn ProcSource, args: RunArgs) 
         let hit = Arc::new(AtomicBool::new(false));
         let mut cmd = Command::new(&args.command[0]);
         cmd.args(&args.command[1..])
+            .env(NESTED, &entry.entry.id)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         if own_group {
