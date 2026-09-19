@@ -194,16 +194,24 @@ fn is_lotse(p: &Proc) -> bool {
     program(p) == "lotse"
 }
 
-/// A shell is never the run itself. Its command line is a script that may
-/// merely MENTION a build: a loop that waits for one, a `pgrep` for one.
-/// Such a shell once sat here for 26 hours, waiting for a pattern that
-/// matched its own command line. The program that does the work is matched
-/// on its own.
-fn is_shell(p: &Proc) -> bool {
-    matches!(
+/// A shell that was handed its script as text (`bash -c '…'`) is never the
+/// run itself. That text may merely MENTION a build: a loop that waits for
+/// one, a `pgrep` for one. Such a shell once sat here for 26 hours, waiting
+/// for a pattern that matched its own command line. The program that does
+/// the work is matched on its own. A shell that runs a script FILE
+/// (`bash scripts/tests.sh`) is an ordinary program.
+fn is_inline_shell(p: &Proc) -> bool {
+    if !matches!(
         program(p),
         "sh" | "bash" | "dash" | "zsh" | "ksh" | "fish" | "nu"
-    )
+    ) {
+        return false;
+    }
+    // Flags come before the script or the `-c` text: `-c`, `-lc`, `-euc`.
+    p.argv[1..]
+        .iter()
+        .take_while(|a| a.starts_with('-'))
+        .any(|a| !a.starts_with("--") && a.contains('c'))
 }
 
 /// Runs that match a class but that no lotse accounts for.
@@ -213,7 +221,7 @@ pub fn observe(cfg: &Config, table: &ProcTable, registered: &[u32]) -> Vec<Obser
     let registered: BTreeSet<u32> = registered.iter().copied().collect();
     let mut hits: Vec<(u32, &str)> = Vec::new();
     for p in table.by_pid.values() {
-        if is_lotse(p) || is_shell(p) {
+        if is_lotse(p) || is_inline_shell(p) {
             continue;
         }
         let line = p.argv.join(" ");
@@ -343,6 +351,21 @@ mod tests {
         let t = ProcTable::new(vec![p(9, 1, 2, &waiting), p(10, 9, 5, NIX)]);
         let o = observe(&cfg(), &t, &[]);
         assert_eq!((o.len(), o[0].pid, o[0].rss_tree), (1, 10, 5));
+    }
+
+    #[test]
+    fn a_shell_running_a_script_file_is_a_program_like_any_other() {
+        let cfg = Config::parse("[class.tests]\nobserve = ['run-tests\\.sh']\n").unwrap();
+        let file = [
+            "/nix/store/x-bash-5.3/bin/bash",
+            "-eu",
+            "scripts/run-tests.sh",
+        ];
+        let inline = ["bash", "-euc", "scripts/run-tests.sh --all"];
+        let t = ProcTable::new(vec![p(9, 1, 2, &file), p(10, 1, 2, &inline)]);
+        let o = observe(&cfg, &t, &[]);
+        assert_eq!(o.len(), 1);
+        assert_eq!(o[0].pid, 9);
     }
 
     #[test]

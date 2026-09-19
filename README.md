@@ -124,9 +124,10 @@ classes' `observe` patterns. Not counted:
 - a wrapper whose subtree holds a registered lotse;
 - all but the root of a chain of matches (`timeout 600 nix build …` and the
   nix below it are one run, with the resident set of the whole tree);
-- **a shell.** Its command line is a script, and a script may merely mention
-  a build: a loop that waits for one, a `pgrep` for one. The program that
-  does the work matches on its own.
+- **a shell that was handed its script as text** (`bash -c '…'`). That text
+  may merely mention a build: a loop that waits for one, a `pgrep` for one.
+  The program that does the work matches on its own. A shell running a
+  script file is a program like any other.
 
 The target of an observed run is what follows `--on`.
 
@@ -177,7 +178,7 @@ are not.
 ## Install
 
 ```nix
-inputs.lotse.url = "github:achimcc/lotse/v0.1.0";
+inputs.lotse.url = "github:achimcc/lotse/v0.1.1";
 # devShell or systemPackages:
 inputs.lotse.packages.${system}.default
 ```
