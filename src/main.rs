@@ -32,14 +32,16 @@ hook    a PreToolUse hook for Claude Code: reads the event on stdin and puts
         `lotse run --class=…` in front of commands of classes with `wrap = true`.
         Never fails the tool call: what it cannot do, it leaves alone.
 
-Durations take a unit: 90s, 30m, 2h. The configuration is the nearest
-lotse.toml upwards from the current directory, else
-$XDG_CONFIG_HOME/lotse/config.toml.
+Durations take a unit: 90s, 30m, 2h. The configuration is --config FILE,
+else $LOTSE_CONFIG, else $XDG_CONFIG_HOME/lotse/config.toml — never a
+lotse.toml found in or above the current directory. It is read only if it
+and its directory belong to you (or root) and nobody else may write them.
 
 EXIT CODES of lotse itself:
   2    usage, configuration or state directory
   200  --max-wait passed
-  201  every attempt failed with a network pattern in its output
+  201  every attempt died of the network (see the README, \"Retry\"); the
+       last line `lotse: exit=<code> verdict=network` names the command's code
 ";
 
 enum Cmd {
@@ -135,8 +137,7 @@ fn known<'a>(cfg: &'a Config, class: &str) -> Result<&'a lotse::config::Class> {
 
 fn real_main() -> Result<i32> {
     let (config, cmd) = parse()?;
-    let cwd = std::env::current_dir().context("no current directory")?;
-    let cfg = Config::load(config.as_deref(), &cwd)?;
+    let cfg = Config::load(config.as_deref())?;
     // Never start uncoordinated because the state is out of reach: that
     // would look like coordination and be none.
     let state = StateDir::open()?;
@@ -182,18 +183,14 @@ fn hook_main() {
     let Ok(event) = serde_json::from_str::<serde_json::Value>(&raw) else {
         return;
     };
-    let cwd = event["cwd"]
-        .as_str()
-        .map(PathBuf::from)
-        .or_else(|| std::env::current_dir().ok());
-    let Some(cwd) = cwd else { return };
-    let cfg = match Config::load(None, &cwd) {
+    // The session's directory plays no part: see `Config::locate`.
+    let Some(path) = Config::locate(None) else {
+        return;
+    };
+    let cfg = match Config::load_from(&path) {
         Ok(cfg) => cfg,
         Err(e) => {
-            // No lotse.toml here: not a repository that wants this.
-            if Config::find(&cwd).is_some() {
-                eprintln!("lotse hook: {e:#}");
-            }
+            eprintln!("lotse hook: {e:#}");
             return;
         }
     };

@@ -165,7 +165,10 @@ fn output_passes_through_and_lands_in_the_log() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("err\n"));
     let log = env.the_log();
     assert!(log.contains("out\n") && log.contains("err\n"), "{log}");
-    assert!(log.contains("lotse: exit=0 attempts=1"), "{log}");
+    assert!(
+        log.contains("lotse: exit=0 verdict=command attempts=1"),
+        "{log}"
+    );
 }
 
 #[test]
@@ -272,7 +275,7 @@ fn a_network_failure_is_retried() {
     assert_eq!(fs::read_to_string(env.path("count")).unwrap().trim(), "2");
     let log = env.the_log();
     assert!(log.contains("retrying in 1s (attempt 2 of 3)"), "{log}");
-    assert!(log.contains("exit=0 attempts=2"), "{log}");
+    assert!(log.contains("exit=0 verdict=command attempts=2"), "{log}");
 }
 
 #[test]
@@ -389,4 +392,299 @@ fn wait_blocks_until_the_class_is_idle() {
     stray.kill().unwrap();
     stray.wait().unwrap();
     assert_eq!(waiter.wait_with_output().unwrap().status.code(), Some(0));
+}
+
+// ---------------------------------------------------------------------------
+// The configuration the hook trusts (audit 3, CD-1).
+
+const WRAP_GIT: &str = "[class.eval]\nwrap = true\nobserve = ['^git\\b']\n";
+
+/// `lotse hook claude` in `cwd`, with nothing of the caller's environment
+/// that could point it at a configuration.
+fn hook(home: &Path, cwd: &Path, extra: &[(&str, &Path)]) -> Output {
+    use std::io::Write;
+    let event = serde_json::json!({
+        "tool_name": "Bash",
+        "tool_input": {"command": "git log -1"},
+        "cwd": cwd,
+    });
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_lotse"));
+    cmd.env_remove("LOTSE_CONFIG")
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .current_dir(cwd)
+        .args(["hook", "claude"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (k, v) in extra {
+        cmd.env(k, v);
+    }
+    let mut child = cmd.spawn().unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(event.to_string().as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "the hook never fails the call");
+    out
+}
+
+fn mode(path: &Path, bits: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(bits)).unwrap();
+}
+
+fn rewritten(out: &Output) -> Option<String> {
+    let text = String::from_utf8_lossy(&out.stdout);
+    if text.trim().is_empty() {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+    Some(
+        v["hookSpecificOutput"]["updatedInput"]["command"]
+            .as_str()
+            .unwrap()
+            .to_string(),
+    )
+}
+
+#[test]
+fn the_hook_reads_no_lotse_toml_upwards_from_the_session() {
+    // What a foreign checkout, or anyone who can write /tmp, would plant.
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let planted = tmp.path().join("planted");
+    let deep = planted.join("a/b/c");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&deep).unwrap();
+    fs::write(planted.join("lotse.toml"), WRAP_GIT).unwrap();
+    mode(&planted, 0o777);
+    let out = hook(&home, &deep, &[]);
+    assert_eq!(rewritten(&out), None);
+    // Not even a trusted-looking one in the session's own directory.
+    mode(&planted, 0o700);
+    assert_eq!(rewritten(&hook(&home, &deep, &[])), None);
+}
+
+#[test]
+fn a_class_name_that_is_not_a_word_rewrites_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let dir = home.join(".config/lotse");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("config.toml"),
+        "[class.\"x -- true; echo INJECTED >&2; #\"]\nwrap = true\nobserve = ['^git\\b']\n",
+    )
+    .unwrap();
+    let out = hook(&home, &home, &[]);
+    assert_eq!(rewritten(&out), None);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("class name"), "{err}");
+}
+
+#[test]
+fn the_per_user_config_is_read_through_symlinks() {
+    // The workstation's layout: ~/.config/lotse/config.toml -> the store ->
+    // the repository's lotse.toml.
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let repo = tmp.path().join("repo");
+    let store = tmp.path().join("store");
+    fs::create_dir_all(home.join(".config/lotse")).unwrap();
+    fs::create_dir_all(&repo).unwrap();
+    fs::create_dir_all(&store).unwrap();
+    fs::write(repo.join("lotse.toml"), WRAP_GIT).unwrap();
+    std::os::unix::fs::symlink(repo.join("lotse.toml"), store.join("hm_lotse.toml")).unwrap();
+    std::os::unix::fs::symlink(
+        store.join("hm_lotse.toml"),
+        home.join(".config/lotse/config.toml"),
+    )
+    .unwrap();
+    assert_eq!(
+        rewritten(&hook(&home, &tmp.path().join("repo"), &[])),
+        Some("lotse run --class=eval -- git log -1".to_string())
+    );
+}
+
+#[test]
+fn lotse_config_names_the_configuration() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let repo = tmp.path().join("repo");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&repo).unwrap();
+    fs::write(repo.join("lotse.toml"), WRAP_GIT).unwrap();
+    let config = repo.join("lotse.toml");
+    assert_eq!(
+        rewritten(&hook(&home, &home, &[("LOTSE_CONFIG", &config)])),
+        Some("lotse run --class=eval -- git log -1".to_string())
+    );
+}
+
+#[test]
+fn a_config_others_can_write_is_ignored() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let dir = home.join(".config/lotse");
+    fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("config.toml");
+    fs::write(&file, WRAP_GIT).unwrap();
+    // Its directory writable by the world.
+    mode(&dir, 0o777);
+    let out = hook(&home, &home, &[]);
+    assert_eq!(rewritten(&out), None);
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("writable"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The file itself writable by the group.
+    mode(&dir, 0o755);
+    mode(&file, 0o664);
+    assert_eq!(rewritten(&hook(&home, &home, &[])), None);
+    // And the control: the same file, trustworthy, is read.
+    mode(&file, 0o644);
+    assert!(rewritten(&hook(&home, &home, &[])).is_some());
+}
+
+#[test]
+fn run_without_a_configuration_is_a_usage_error() {
+    // A lotse.toml in the current directory is not read any more.
+    let env = Env::new();
+    let out = Command::new(env!("CARGO_BIN_EXE_lotse"))
+        .env_remove("LOTSE_CONFIG")
+        .env("HOME", env.path("nohome"))
+        .env("XDG_CONFIG_HOME", env.path("nohome/.config"))
+        .env("XDG_RUNTIME_DIR", env.path("run"))
+        .current_dir(env.tmp.path())
+        .args(["run", "--class", "one", "--", "true"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("LOTSE_CONFIG"), "{err}");
+}
+
+// ---------------------------------------------------------------------------
+// The network verdict (audit 3, CD-3).
+
+impl Env {
+    fn last_log_line(&self) -> String {
+        self.the_log().lines().last().unwrap().to_string()
+    }
+}
+
+#[test]
+fn a_network_word_before_the_real_error_is_the_real_error() {
+    let env = Env::new();
+    let script = format!(
+        "echo x >> {}; echo 'warning: Could not resolve host: x'; \
+         echo 'error: assertion failed (a real red check)'; exit 1",
+        env.path("n").display()
+    );
+    assert_eq!(
+        env.code(&["run", "--class", "net", "--", "sh", "-c", &script]),
+        1
+    );
+    assert_eq!(fs::read_to_string(env.path("n")).unwrap(), "x\n");
+    let last = env.last_log_line();
+    assert!(
+        last.starts_with("lotse: exit=1 verdict=command attempts=1"),
+        "{last}"
+    );
+}
+
+#[test]
+fn nix_s_follow_up_errors_do_not_hide_the_network() {
+    // What nix prints after a substitution died of DNS: the derivations that
+    // could not be built for it. They are consequences, not a new error.
+    let env = Env::new();
+    let script = format!(
+        "n=$(cat {c} 2>/dev/null || echo 0); echo $((n+1)) > {c}; \
+         if [ $n -lt 1 ]; then \
+           echo \"error: Cannot build '/nix/store/abc-x.drv'.\" >&2; \
+           echo '       > curl: (6) Could not resolve host: example.org' >&2; \
+           echo '       > error: cannot download x from any mirror' >&2; \
+           echo \"error: Cannot build '/nix/store/def-y.drv'.\" >&2; \
+           echo \"error: 1 dependencies of derivation '/nix/store/ghi-z.drv' failed to build\" >&2; \
+           exit 1; fi",
+        c = env.path("count").display()
+    );
+    assert_eq!(
+        env.code(&["run", "--class", "net", "--", "sh", "-c", &script]),
+        0
+    );
+    assert_eq!(fs::read_to_string(env.path("count")).unwrap().trim(), "2");
+}
+
+#[test]
+fn the_last_line_carries_the_real_code_and_the_verdict() {
+    let env = Env::new();
+    let out = env.output(&["run", "--class", "net", "--", "sh", "-c", &flaky(&env, 99)]);
+    // The process exit stays 201: scripts tell "no verdict" by it.
+    assert_eq!(out.status.code(), Some(201));
+    let last = env.last_log_line();
+    assert!(
+        last.starts_with("lotse: exit=1 verdict=network attempts=3"),
+        "{last}"
+    );
+}
+
+#[test]
+fn a_command_that_exits_201_itself_says_so() {
+    let env = Env::new();
+    assert_eq!(
+        env.code(&["run", "--class", "one", "--", "sh", "-c", "exit 201"]),
+        201
+    );
+    let last = env.last_log_line();
+    assert!(
+        last.starts_with("lotse: exit=201 verdict=command"),
+        "{last}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Logs (audit 3, CD-11).
+
+#[test]
+fn logs_are_private_and_old_ones_are_removed() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new();
+    let dir = env.path("state/lotse/logs");
+    fs::create_dir_all(&dir).unwrap();
+    let old = dir.join("20250101-000000-00000001-1.log");
+    let young = dir.join("20260101-000000-00000002-2.log");
+    let other = dir.join("notes.txt");
+    for f in [&old, &young, &other] {
+        fs::write(f, "x").unwrap();
+    }
+    mode(&young, 0o644);
+    let long_ago = std::time::SystemTime::now() - Duration::from_secs(60 * 24 * 3600);
+    for f in [&old, &other] {
+        fs::File::options()
+            .write(true)
+            .open(f)
+            .unwrap()
+            .set_modified(long_ago)
+            .unwrap();
+    }
+    assert_eq!(env.code(&["run", "--class", "one", "--", "true"]), 0);
+    assert!(!old.exists(), "a log older than the limit stays");
+    assert!(young.exists() && other.exists());
+    let perm = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(perm(&dir), 0o700);
+    assert_eq!(perm(&young), 0o600);
+    let new: Vec<PathBuf> = fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p != &young && p != &other)
+        .collect();
+    assert_eq!(new.len(), 1, "{new:?}");
+    assert_eq!(perm(&new[0]), 0o600);
 }

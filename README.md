@@ -25,7 +25,7 @@ memory: 7.2G available, 4.0G reserve, 6.3G still to be claimed by running jobs
 $ lotse run --class eval -- nix build .#nixosConfigurations.server.config.system.build.toplevel
 lotse: waiting: memory: need 16.0G including the reserve, 0.9G left after what running jobs will still grow
 …
-lotse: exit=0 attempts=1 waited=252s ran=431s log=/home/me/.local/state/lotse/logs/20260919-123816-00000007-3688102.log
+lotse: exit=0 verdict=command attempts=1 waited=252s ran=431s log=/home/me/.local/state/lotse/logs/20260919-123816-00000007-3688102.log
 ```
 
 There is no daemon. The state is a directory; whether a run is alive is
@@ -40,9 +40,13 @@ lotse wait CLASS [--target T] [--max-wait D]
 ```
 
 **`run`** waits for admission, then runs the command. Its output goes to the
-terminal unchanged and into a log under `$XDG_STATE_HOME/lotse/logs/`. lotse
-exits with the command's exit code (128 + signal if a signal ended it), and
-the last line of the log states it — a background run whose notification
+terminal unchanged and into a log under `$XDG_STATE_HOME/lotse/logs/`
+(mode 0600, directory 0700; logs older than 30 days are removed when the next
+run opens its own). lotse exits with the command's exit code (128 + signal if
+a signal ended it), and the last line of the output and the log states it —
+`lotse: exit=<code> verdict=<command|network|interrupted> attempts=…`. The
+code there is always the command's own, also when lotse itself exits with
+201; `verdict` says whose word it is. A background run whose notification
 shows the exit code of some other line can be looked up there.
 
 **`status`** lists what runs and what waits: registered runs, and runs that
@@ -55,10 +59,27 @@ observed. It is what belongs in front of a measurement
 
 ## Configuration
 
-`lotse.toml`, the nearest one upwards from the current directory, so it lives
-in the repository whose runs it describes; else
-`$XDG_CONFIG_HOME/lotse/config.toml`. See
-[`lotse.example.toml`](lotse.example.toml). An unknown key is an error: a
+One file, from the first of:
+
+1. `--config FILE`,
+2. `$LOTSE_CONFIG`,
+3. `$XDG_CONFIG_HOME/lotse/config.toml` (`~/.config/lotse/config.toml`).
+
+**Never a `lotse.toml` found in or above the current directory** (up to
+0.2.x it was). The hook runs in every session on the machine, in whatever
+directory the session works — a checkout of someone else's repository, a
+scratch directory under `/tmp` — and the class names of the file it finds end
+up in that session's command lines. A repository that keeps its own
+`lotse.toml` points at it: `export LOTSE_CONFIG="$PWD/lotse.toml"` in its dev
+shell, or a symlink from `~/.config/lotse/config.toml` to it.
+
+The file is read only if it is trustworthy, after all symlinks are followed:
+the file and the directory it is in belong to you or root, and neither is
+writable by group or others. Otherwise lotse refuses it (`run`, `status`,
+`wait` exit 2; the hook stays silent and says why on stderr). A class name is
+letters, digits, `_` and `-`; anything else is a configuration error.
+
+See [`lotse.example.toml`](lotse.example.toml). An unknown key is an error: a
 typo in a limit must not silently select the default.
 
 | key | meaning |
@@ -149,11 +170,33 @@ It is not enforcement: lotse cannot make an unregistered run wait.
 
 ## Retry
 
-A run is repeated only if it **failed** and one of the class's
-`retry.patterns` stood in its output — never on the exit code alone, never on
-the pattern alone. After `times` repetitions lotse exits with **201**, which
-says: this was the network every time, not a verdict of the command. The slot
-is held across the pause.
+A run is repeated only if it **failed** and **the last error of its output
+was the network** — never on the exit code alone, never on a pattern
+somewhere in the output. Line by line, stdout and stderr in the order they
+arrive:
+
+- a line that matches one of the class's `retry.patterns` makes the verdict
+  *network*;
+- a later **error line of another kind** makes it *command* again. An error
+  line starts with `error` or `fatal` (any case, colour codes ignored);
+  indented lines — a nix builder's output quoted under the error that names
+  it — are not error lines;
+- except nix's **consequences** of a failed download, which name what could
+  not be built for it and not why: `error: Cannot build '…`, `error: builder
+  for '…`, `error: N dependencies of derivation '…`, `error: some substitutes
+  for the outputs of derivation '…`, `error: some references of path '…`,
+  `error: some outputs of '…`, `error: path '…' is required, but there is no
+  substituter…`.
+
+So `warning: unable to download …` followed by `error: assertion failed` is
+the assertion's verdict, not the network's: nix prints download warnings long
+before the error that decides. Up to 0.2.x any pattern anywhere counted, and
+a red check came back as "network, no verdict".
+
+After `times` repetitions lotse exits with **201**, which says: this was the
+network every time, not a verdict of the command. The last line still names
+the command's code: `lotse: exit=1 verdict=network …`. The slot is held
+across the pause.
 
 A class without `retry` is never repeated. Give none to anything that acts on
 the outside world.
@@ -182,12 +225,13 @@ and keywords like `if` and `then`. Text that merely mentions a build —
 comment, a commit message — is not a command and stays.
 
 **What it does not follow, it does not touch:** a here-document (its body is
-data), backticks, `$(( … ))`, unbalanced quotes. The whole call then runs as
+data), backticks, `$(( … ))`, `$'…'` (it knows `\'`), `${…}` (it may hold
+`;`, blanks and quotes of its own), unbalanced quotes. The whole call then runs as
 it was written — unqueued, but observed like any other. It returns no
 `permissionDecision`: the rewritten command goes through the same permission
-flow as every other. It queues, it does not approve. Without a `lotse.toml`
-upwards from the session's directory it does nothing, and whatever goes wrong
-inside it ends in silence and exit code 0.
+flow as every other. It queues, it does not approve. It reads the configuration
+as described above — never from the session's directory — and without one it
+does nothing. Whatever goes wrong inside it ends in silence and exit code 0.
 
 The wrapper is written as `--class=eval`, one word: a sandbox in front of the
 shell may refuse a bare `eval`.
@@ -208,11 +252,17 @@ after the first becomes `SIGKILL`. A signal while queued removes the entry.
 | 2 | usage, configuration, or no state directory — lotse never starts a command uncoordinated because it could not coordinate |
 | 127 | the command could not be started |
 | 200 | `--max-wait` passed |
-| 201 | every attempt failed with a network pattern in its output |
+| 201 | every attempt died of the network (see "Retry"); the last line reads `exit=<the command's code> verdict=network` |
 
 A command that exits with 200 or 201 itself is indistinguishable by the code;
-the last line of the log (`lotse: exit=… attempts=…`) and the line before it
-are not.
+the last line is not: `lotse: exit=201 verdict=command`.
+
+## State
+
+`$XDG_RUNTIME_DIR/lotse`, else `/tmp/lotse-<uid>`. The directory and its
+`entries` must be real directories (no symlink), yours, and mode 0700 — under
+`/tmp` anyone could have created it first — or lotse exits 2. Files in it are
+created 0600 and never through a symlink.
 
 ## What it does not do
 
@@ -225,7 +275,7 @@ are not.
 ## Install
 
 ```nix
-inputs.lotse.url = "github:achimcc/lotse/v0.2.1";
+inputs.lotse.url = "github:achimcc/lotse/v0.3.0";
 # devShell or systemPackages:
 inputs.lotse.packages.${system}.default
 ```

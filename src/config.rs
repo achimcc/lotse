@@ -10,7 +10,8 @@ use serde::Deserialize;
 
 use crate::units::{parse_duration, parse_size};
 
-pub const FILE_NAME: &str = "lotse.toml";
+/// Names the configuration file, ahead of the per-user one.
+pub const ENV_VAR: &str = "LOTSE_CONFIG";
 
 #[derive(Debug)]
 pub struct Config {
@@ -96,10 +97,80 @@ fn patterns(raw: &[String], what: &str) -> Result<Vec<Regex>> {
         .collect()
 }
 
+/// A class name ends up in a command line (`lotse hook claude` writes
+/// `lotse run --class=<name> --`), so it is one plain word or nothing.
+fn plain_word(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// What makes a file or directory unfit to be trusted as configuration:
+/// someone other than us (or root) owns it, or others may write to it.
+fn trust_problem(what: &str, path: &Path, uid: u32, mode: u32, me: u32) -> Option<String> {
+    if uid != me && uid != 0 {
+        return Some(format!(
+            "{what} {} belongs to uid {uid}, not to us ({me}) or root",
+            path.display()
+        ));
+    }
+    if mode & 0o022 != 0 {
+        return Some(format!(
+            "{what} {} is writable by group or others (mode {:04o})",
+            path.display(),
+            mode & 0o7777
+        ));
+    }
+    None
+}
+
+/// Reads a configuration file only if nobody but us (or root) could have
+/// written it: the file, after all symlinks, and the directory it is in.
+/// A `lotse.toml` is as good as code — its class names end up in command
+/// lines — so it gets the treatment ssh gives an `authorized_keys`.
+fn read_trusted(path: &Path) -> Result<String> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let real = path
+        .canonicalize()
+        .with_context(|| format!("cannot read {}", path.display()))?;
+    let me = rustix::process::geteuid().as_raw();
+    let dir = real.parent().unwrap_or(Path::new("/"));
+    let dir_meta =
+        std::fs::metadata(dir).with_context(|| format!("cannot read {}", dir.display()))?;
+    if let Some(problem) = trust_problem("directory", dir, dir_meta.uid(), dir_meta.mode(), me) {
+        bail!("not trusted: {problem}");
+    }
+    // The resolved path, not followed a second time: what is checked is what is read.
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
+        .open(&real)
+        .with_context(|| format!("cannot read {}", real.display()))?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        bail!("not trusted: {} is not a regular file", real.display());
+    }
+    if let Some(problem) = trust_problem("file", &real, meta.uid(), meta.mode(), me) {
+        bail!("not trusted: {problem}");
+    }
+    let mut text = String::new();
+    file.read_to_string(&mut text)
+        .with_context(|| format!("cannot read {}", real.display()))?;
+    Ok(text)
+}
+
 impl Config {
     pub fn parse(text: &str) -> Result<Config> {
         let raw: RawConfig = toml::from_str(text)?;
         let mut classes = BTreeMap::new();
+        for name in raw.class.keys() {
+            if !plain_word(name) {
+                bail!("class name {name:?}: only letters, digits, '_' and '-' are allowed");
+            }
+        }
         for (name, c) in &raw.class {
             for other in &c.exclusive_with {
                 if !raw.class.contains_key(other) {
@@ -160,33 +231,41 @@ impl Config {
         })
     }
 
-    /// `lotse.toml` upwards from `start`, then the per-user file.
-    pub fn find(start: &Path) -> Option<PathBuf> {
-        for dir in start.ancestors() {
-            let candidate = dir.join(FILE_NAME);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
+    /// Where the configuration is: `--config`, else `$LOTSE_CONFIG`, else
+    /// `$XDG_CONFIG_HOME/lotse/config.toml` if it exists. `None`: nowhere.
+    ///
+    /// Never from the current directory or above it. The hook runs in every
+    /// session on the machine, in whatever directory it works — a foreign
+    /// checkout, a scratch directory under `/tmp` — and a `lotse.toml` found
+    /// there would put its class names into the session's command lines.
+    pub fn locate(explicit: Option<&Path>) -> Option<PathBuf> {
+        if let Some(p) = explicit {
+            return Some(p.to_path_buf());
+        }
+        if let Some(p) = std::env::var_os(ENV_VAR).filter(|v| !v.is_empty()) {
+            return Some(PathBuf::from(p));
         }
         let base = std::env::var_os("XDG_CONFIG_HOME")
+            .filter(|v| !v.is_empty())
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
         let candidate = base.join("lotse").join("config.toml");
-        candidate.is_file().then_some(candidate)
+        // `exists` follows symlinks: a dangling one counts as none.
+        candidate.exists().then_some(candidate)
     }
 
-    pub fn load(explicit: Option<&Path>, cwd: &Path) -> Result<Config> {
-        let path = match explicit {
-            Some(p) => p.to_path_buf(),
-            None => Config::find(cwd).with_context(|| {
-                format!(
-                    "no {FILE_NAME} found upwards from {} and no per-user config.toml",
-                    cwd.display()
-                )
-            })?,
-        };
-        let text = std::fs::read_to_string(&path)
-            .with_context(|| format!("cannot read {}", path.display()))?;
+    pub fn load(explicit: Option<&Path>) -> Result<Config> {
+        let path = Config::locate(explicit).with_context(|| {
+            format!(
+                "no configuration: pass --config FILE, set {ENV_VAR}, \
+                 or create $XDG_CONFIG_HOME/lotse/config.toml"
+            )
+        })?;
+        Config::load_from(&path)
+    }
+
+    pub fn load_from(path: &Path) -> Result<Config> {
+        let text = read_trusted(path)?;
         Config::parse(&text).with_context(|| format!("in {}", path.display()))
     }
 
@@ -260,6 +339,24 @@ mod tests {
     }
 
     #[test]
+    fn a_class_name_must_be_a_plain_word() {
+        // It ends up in a command line (`lotse hook claude`), CD-1.
+        for bad in [
+            "x -- true; echo INJECTED >&2; #",
+            "a b",
+            "$(id)",
+            "a'b",
+            "",
+            "ä",
+        ] {
+            let text = format!("[class.{bad:?}]\n");
+            let err = Config::parse(&text).expect_err(bad);
+            assert!(err.to_string().contains("class name"), "{bad}: {err}");
+        }
+        assert!(Config::parse("[class.eval-2_x]\n").is_ok());
+    }
+
+    #[test]
     fn defaults() {
         let cfg = Config::parse("[class.a]\n").unwrap();
         assert_eq!(cfg.reserve, 0);
@@ -268,11 +365,22 @@ mod tests {
     }
 
     #[test]
-    fn finds_the_file_upwards() {
+    fn a_foreign_or_open_file_is_not_trusted() {
+        let p = Path::new("/x");
+        assert!(trust_problem("file", p, 1000, 0o100644, 1000).is_none());
+        assert!(trust_problem("file", p, 0, 0o100444, 1000).is_none());
+        assert!(trust_problem("file", p, 1001, 0o100644, 1000).is_some());
+        assert!(trust_problem("file", p, 1000, 0o100664, 1000).is_some());
+        assert!(trust_problem("file", p, 1000, 0o100646, 1000).is_some());
+        // A sticky world-writable directory (/tmp) is not a home for it either.
+        assert!(trust_problem("directory", p, 0, 0o41777, 1000).is_some());
+    }
+
+    #[test]
+    fn a_trusted_file_loads() {
         let dir = tempfile::tempdir().unwrap();
-        let deep = dir.path().join("a/b");
-        std::fs::create_dir_all(&deep).unwrap();
-        std::fs::write(dir.path().join(FILE_NAME), "").unwrap();
-        assert_eq!(Config::find(&deep), Some(dir.path().join(FILE_NAME)));
+        let file = dir.path().join("lotse.toml");
+        std::fs::write(&file, "[class.a]\n").unwrap();
+        assert!(Config::load_from(&file).unwrap().classes.contains_key("a"));
     }
 }

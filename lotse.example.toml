@@ -1,5 +1,8 @@
-# lotse.toml: found upwards from the current directory, so it lives in the
-# repository whose runs it describes. An unknown key is an error.
+# lotse.toml: read from --config, $LOTSE_CONFIG or
+# $XDG_CONFIG_HOME/lotse/config.toml — never from the current directory. It
+# must belong to you (or root) and be writable by nobody else, and so must
+# its directory. Class names: letters, digits, '_' and '-'. An unknown key is
+# an error.
 
 # Memory that stays free whatever is admitted.
 reserve = "4G"
@@ -25,7 +28,8 @@ observe = [
   '^(\S*/)?nix flake check\b',
   '^(\S*/)?colmena (build|apply\b.* (build|dry-activate))\b',
 ]
-# Retried only if the run FAILED and one of these stood in its output.
+# Retried only if the run FAILED and the last error of its output matched one
+# of these (README, "Retry"): a download warning before an assertion does not.
 retry = { patterns = ['Could not resolve host', 'unable to download', 'daemon disconnected'], times = 3, pause = "30s" }
 
 # One deploy per machine. No retry: what acts on the outside world is not

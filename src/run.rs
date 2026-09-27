@@ -67,26 +67,98 @@ impl Signals {
     }
 }
 
-/// Finds the retry patterns in a stream that arrives in arbitrary pieces.
-struct LineScan {
+/// Where the output of one attempt stands with respect to the network.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Tail {
+    /// No retry pattern yet, or none since the last error of another kind.
+    Clean,
+    /// A retry pattern, and after it no error of another kind.
+    Network,
+}
+
+/// Errors nix prints BECAUSE something could not be fetched: the
+/// derivations and paths that failed for it. After a network pattern they
+/// are its consequences, not an error of their own.
+const CONSEQUENCES: &[&str] = &[
+    r"^error: Cannot build '",
+    r"^error: builder for '",
+    r"^error: \d+ dependencies of derivation '",
+    r"^error: some substitutes for the outputs of derivation '",
+    r"^error: some references of path '",
+    r"^error: some outputs of '",
+    r"^error: path '[^']*' is required, but there is no substituter",
+];
+
+/// An error line of its own: `error:`, `fatal:` and the like at the start of
+/// a line. Indented lines are the output of a nix builder, quoted under the
+/// error that names it.
+const ERROR_LINE: &str = r"(?i)^(error|fatal)\b";
+
+/// Decides, line by line, whether an attempt died of the network.
+///
+/// The rule: the LAST error of the output must be a network pattern. A line
+/// that matches one of the class's `retry.patterns` sets the verdict to
+/// network; a later error line of another kind sets it back — unless it is
+/// one of nix's consequences of a failed download. A pattern anywhere in the
+/// output is not enough: nix prints download warnings long before the
+/// assertion that is the real verdict (audit 3, CD-3).
+struct Judge {
     patterns: Vec<Regex>,
+    /// Colour codes, taken off before a line is judged.
+    ansi: Regex,
+    error: Regex,
+    consequences: Vec<Regex>,
+    tail: Tail,
+}
+
+impl Judge {
+    fn new(patterns: Vec<Regex>) -> Judge {
+        Judge {
+            patterns,
+            ansi: Regex::new(r"\x1b\[[0-9;]*[A-Za-z]").expect("a valid pattern"),
+            error: Regex::new(ERROR_LINE).expect("a valid pattern"),
+            consequences: CONSEQUENCES
+                .iter()
+                .map(|p| Regex::new(p).expect("a valid pattern"))
+                .collect(),
+            tail: Tail::Clean,
+        }
+    }
+
+    fn line(&mut self, text: &str) {
+        let text = &*self.ansi.replace_all(text, "");
+        if self.patterns.iter().any(|re| re.is_match(text)) {
+            self.tail = Tail::Network;
+        } else if self.tail == Tail::Network
+            && self.error.is_match(text)
+            && !self.consequences.iter().any(|re| re.is_match(text))
+        {
+            self.tail = Tail::Clean;
+        }
+    }
+}
+
+type SharedJudge = Arc<Mutex<Judge>>;
+
+/// Cuts a stream that arrives in arbitrary pieces into lines for the judge.
+/// One per stream; the judge is shared, so it sees the lines of stdout and
+/// stderr in the order they arrived.
+struct LineScan {
+    judge: SharedJudge,
     line: Vec<u8>,
-    hit: Arc<AtomicBool>,
 }
 
 impl LineScan {
     fn check(&mut self) {
         if !self.line.is_empty() {
             let text = String::from_utf8_lossy(&self.line);
-            if self.patterns.iter().any(|re| re.is_match(&text)) {
-                self.hit.store(true, Ordering::SeqCst);
-            }
+            self.judge.lock().unwrap().line(&text);
             self.line.clear();
         }
     }
 
     fn feed(&mut self, chunk: &[u8]) {
-        if self.patterns.is_empty() {
+        if self.judge.lock().unwrap().patterns.is_empty() {
             return;
         }
         for &b in chunk {
@@ -150,11 +222,67 @@ fn logs_dir() -> Option<PathBuf> {
     Some(base.join("lotse").join("logs"))
 }
 
+/// Logs older than this are removed when the next run opens its own. They
+/// hold the whole output of every run, and nobody reads a month-old one.
+pub const KEEP_LOGS: Duration = Duration::from_secs(30 * 24 * 3600);
+
+/// Our logs only: `<stamp>-<id>.log`, regular files, ours.
+fn prune_logs(dir: &std::path::Path) {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let me = rustix::process::geteuid().as_raw();
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|e| e != "log") {
+            continue;
+        }
+        // Not followed: a symlink here is nothing of ours.
+        let Ok(meta) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !meta.is_file() || meta.uid() != me {
+            continue;
+        }
+        let old = meta
+            .modified()
+            .ok()
+            .and_then(|m| m.elapsed().ok())
+            .is_some_and(|age| age > KEEP_LOGS);
+        if old {
+            let _ = fs::remove_file(&path);
+        } else if meta.mode() & 0o077 != 0 {
+            // Written by a lotse before 0.3.0, readable by everyone.
+            let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+        }
+    }
+}
+
 fn open_log(entry: &OwnedEntry) -> (Log, Option<PathBuf>) {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
     let opened = logs_dir().and_then(|dir| {
-        fs::create_dir_all(&dir).ok()?;
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&dir)
+            .ok()?;
+        // A directory from before 0.3.0 was created with the umask.
+        let meta = fs::symlink_metadata(&dir).ok()?;
+        if meta.is_dir()
+            && meta.uid() == rustix::process::geteuid().as_raw()
+            && meta.mode() & 0o077 != 0
+        {
+            let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
+        }
+        prune_logs(&dir);
         let path = dir.join(format!("{}-{}.log", utc_stamp(now()), entry.entry.id));
-        let mut f = File::create(&path).ok()?;
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .ok()?;
         let e = &entry.entry;
         let _ = writeln!(
             f,
@@ -350,9 +478,14 @@ pub fn run(cfg: &Config, state: &StateDir, src: &dyn ProcSource, args: RunArgs) 
 
     let started_at = Instant::now();
     let mut attempts = 0;
-    let code = loop {
+    // The command's own code, whatever lotse exits with.
+    let mut code;
+    // Whose word the code is: the command's, the network's (every attempt
+    // died of it), or a signal's during the pause between attempts.
+    let verdict;
+    loop {
         attempts += 1;
-        let hit = Arc::new(AtomicBool::new(false));
+        let judge: SharedJudge = Arc::new(Mutex::new(Judge::new(patterns.clone())));
         let mut cmd = Command::new(&args.command[0]);
         cmd.args(&args.command[1..])
             .env(NESTED, &entry.entry.id)
@@ -368,21 +501,28 @@ pub fn run(cfg: &Config, state: &StateDir, src: &dyn ProcSource, args: RunArgs) 
                     &log,
                     &format!("lotse: cannot start {:?}: {e}", args.command[0]),
                 );
-                break 127;
+                code = 127;
+                verdict = "command";
+                break;
             }
         };
         entry.update(|e| e.child_pid = Some(child.id()))?;
 
         let (done_tx, done_rx) = mpsc::channel();
-        let scan = |hit: &Arc<AtomicBool>| LineScan {
-            patterns: patterns.clone(),
+        let scan = |judge: &SharedJudge| LineScan {
+            judge: Arc::clone(judge),
             line: Vec::new(),
-            hit: Arc::clone(hit),
         };
         let stdout = child.stdout.take().expect("piped");
         let stderr = child.stderr.take().expect("piped");
-        copy_stream(stdout, false, Arc::clone(&log), scan(&hit), done_tx.clone());
-        copy_stream(stderr, true, Arc::clone(&log), scan(&hit), done_tx);
+        copy_stream(
+            stdout,
+            false,
+            Arc::clone(&log),
+            scan(&judge),
+            done_tx.clone(),
+        );
+        copy_stream(stderr, true, Arc::clone(&log), scan(&judge), done_tx);
 
         let attempt = supervise(&mut child, own_group, &signals)?;
         let deadline = Instant::now() + DRAIN;
@@ -393,9 +533,13 @@ pub fn run(cfg: &Config, state: &StateDir, src: &dyn ProcSource, args: RunArgs) 
             }
         }
 
-        let network = attempt.code != 0 && !attempt.interrupted && hit.load(Ordering::SeqCst);
+        let network = attempt.code != 0
+            && !attempt.interrupted
+            && judge.lock().unwrap().tail == Tail::Network;
+        code = attempt.code;
         if !network {
-            break attempt.code;
+            verdict = "command";
+            break;
         }
         if attempts >= max_attempts {
             log_line(
@@ -406,7 +550,8 @@ pub fn run(cfg: &Config, state: &StateDir, src: &dyn ProcSource, args: RunArgs) 
                     attempt.code
                 ),
             );
-            break EXIT_NETWORK;
+            verdict = "network";
+            break;
         }
         let pause = retry.map_or(Duration::ZERO, |r| r.pause);
         log_line(
@@ -427,14 +572,16 @@ pub fn run(cfg: &Config, state: &StateDir, src: &dyn ProcSource, args: RunArgs) 
             sleep(Duration::from_millis(100));
         }
         if let Some(sig) = interrupted {
-            break 128 + sig;
+            code = 128 + sig;
+            verdict = "interrupted";
+            break;
         }
-    };
+    }
 
     log_line(
         &log,
         &format!(
-            "lotse: exit={code} attempts={attempts} waited={}s ran={}s log={}",
+            "lotse: exit={code} verdict={verdict} attempts={attempts} waited={}s ran={}s log={}",
             waited.as_secs(),
             started_at.elapsed().as_secs(),
             log_path
@@ -442,45 +589,91 @@ pub fn run(cfg: &Config, state: &StateDir, src: &dyn ProcSource, args: RunArgs) 
                 .map_or("-".to_string(), |p| p.display().to_string())
         ),
     );
-    Ok(code)
+    // 201 as the process's exit code: a caller that reads only the code
+    // still tells "no verdict" apart. The line above names the real one.
+    Ok(if verdict == "network" {
+        EXIT_NETWORK
+    } else {
+        code
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn scan(patterns: &[&str]) -> (LineScan, Arc<AtomicBool>) {
-        let hit = Arc::new(AtomicBool::new(false));
+    fn scan(patterns: &[&str]) -> (LineScan, SharedJudge) {
+        let judge = Arc::new(Mutex::new(Judge::new(
+            patterns.iter().map(|p| Regex::new(p).unwrap()).collect(),
+        )));
         let scan = LineScan {
-            patterns: patterns.iter().map(|p| Regex::new(p).unwrap()).collect(),
+            judge: Arc::clone(&judge),
             line: Vec::new(),
-            hit: Arc::clone(&hit),
         };
-        (scan, hit)
+        (scan, judge)
+    }
+
+    fn network(judge: &SharedJudge) -> bool {
+        judge.lock().unwrap().tail == Tail::Network
     }
 
     #[test]
     fn a_pattern_split_across_chunks_is_found() {
-        let (mut s, hit) = scan(&["Could not resolve host"]);
+        let (mut s, judge) = scan(&["Could not resolve host"]);
         s.feed(b"error: Could not res");
         s.feed(b"olve host: cache.nixos.org\n");
-        assert!(hit.load(Ordering::SeqCst));
+        assert!(network(&judge));
     }
 
     #[test]
     fn a_last_line_without_newline_is_found_at_the_end() {
-        let (mut s, hit) = scan(&["daemon disconnected"]);
+        let (mut s, judge) = scan(&["daemon disconnected"]);
         s.feed(b"Nix daemon disconnected");
-        assert!(!hit.load(Ordering::SeqCst));
+        assert!(!network(&judge));
         s.check();
-        assert!(hit.load(Ordering::SeqCst));
+        assert!(network(&judge));
     }
 
     #[test]
     fn other_output_is_no_hit() {
-        let (mut s, hit) = scan(&["Could not resolve host"]);
+        let (mut s, judge) = scan(&["Could not resolve host"]);
         s.feed(b"error: assertion failed\nresolve\n");
         s.check();
-        assert!(!hit.load(Ordering::SeqCst));
+        assert!(!network(&judge));
+    }
+
+    #[test]
+    fn an_error_after_the_pattern_is_the_verdict() {
+        let (mut s, judge) = scan(&["Could not resolve host:"]);
+        s.feed(b"warning: Could not resolve host: x\nerror: assertion failed\n");
+        assert!(!network(&judge));
+        // A later network error is the last word again.
+        s.feed(b"error: unable to fetch: Could not resolve host: y\n");
+        assert!(network(&judge));
+        // Output that is no error does not change it.
+        s.feed(b"some progress\n       > error: from a builder\n");
+        assert!(network(&judge));
+    }
+
+    #[test]
+    fn nix_s_consequences_keep_the_network_verdict() {
+        let (mut s, judge) = scan(&["unable to download"]);
+        s.feed(b"warning: unable to download 'https://c/x.narinfo': timeout\n");
+        s.feed(b"error: path '/nix/store/abc-x' is required, but there is no substituter that can build it\n");
+        s.feed(b"error: some references of path '/nix/store/abc-x' could not be realised\n");
+        s.feed(b"error: some substitutes for the outputs of derivation '/nix/store/d.drv' failed to build\n");
+        s.feed(b"error: Cannot build '/nix/store/e.drv'.\n");
+        s.feed(b"error: builder for '/nix/store/f.drv' failed with exit code 1\n");
+        s.feed(b"error: 2 dependencies of derivation '/nix/store/g.drv' failed to build\n");
+        assert!(network(&judge));
+        s.feed(b"error:\n       Failed assertions:\n");
+        assert!(!network(&judge));
+    }
+
+    #[test]
+    fn colour_does_not_hide_an_error() {
+        let (mut s, judge) = scan(&["Could not resolve host:"]);
+        s.feed(b"warning: Could not resolve host: x\n\x1b[31;1merror:\x1b[0m assertion failed\n");
+        assert!(!network(&judge));
     }
 }

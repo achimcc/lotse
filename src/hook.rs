@@ -77,6 +77,10 @@ fn inserts(cfg: &Config, text: &str) -> Option<Vec<Insert>> {
                     stack.pop();
                 }
                 b'`' => return None,
+                // A parameter expansion may hold quotes of its own, and a
+                // `"` in `"${v:-"…"}"` opens a new string rather than
+                // closing this one.
+                b'$' if bytes.get(i + 1) == Some(&b'{') => return None,
                 b'$' if bytes.get(i + 1) == Some(&b'(') => {
                     if bytes.get(i + 2) == Some(&b'(') {
                         return None;
@@ -163,6 +167,9 @@ fn inserts(cfg: &Config, text: &str) -> Option<Vec<Insert>> {
                             break;
                         }
                         b'`' => return None,
+                        // `$'…'` knows `\'`, and `${…}` may hold `;`, blanks
+                        // and quotes: neither is followed (CD-12).
+                        b'$' if matches!(bytes.get(i + 1), Some(b'\'' | b'{')) => return None,
                         b'$' if bytes.get(i + 1) == Some(&b'(') => {
                             if bytes.get(i + 2) == Some(&b'(') {
                                 return None;
@@ -185,6 +192,20 @@ fn inserts(cfg: &Config, text: &str) -> Option<Vec<Insert>> {
     stack.is_empty().then_some(out)
 }
 
+/// `s` as one shell word. The class names are plain words already
+/// (`Config::parse` refuses anything else); this is the second lock on the
+/// same door, should a name ever come from somewhere else.
+fn shell_word(s: &str) -> std::borrow::Cow<'_, str> {
+    let plain = !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'/'));
+    if plain {
+        s.into()
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''")).into()
+    }
+}
+
 /// The command with the wrappers in place, and the classes that were wrapped.
 /// `None`: nothing to do, or nothing that may safely be done.
 pub fn rewrite(cfg: &Config, command: &str) -> Option<(String, Vec<String>)> {
@@ -196,7 +217,10 @@ pub fn rewrite(cfg: &Config, command: &str) -> Option<(String, Vec<String>)> {
     // From the back, so that the earlier offsets stay valid.
     for ins in found.iter().rev() {
         // `--class=x`, one word: some sandboxes refuse a bare `eval` word.
-        text.insert_str(ins.at, &format!("lotse run --class={} -- ", ins.class));
+        text.insert_str(
+            ins.at,
+            &format!("lotse run --class={} -- ", shell_word(&ins.class)),
+        );
     }
     let mut classes: Vec<String> = found.into_iter().map(|i| i.class).collect();
     classes.dedup();
@@ -225,7 +249,8 @@ pub fn claude_pre_tool_use(cfg: &Config, event: &Value) -> Option<Value> {
                  (lotse run --class={}). It may wait for memory; `lotse status` shows for whom. \
                  Exit code 200 means the wait limit passed, 201 means every attempt died of the \
                  network: neither is a verdict of the command. The last line of the output \
-                 (`lotse: exit=…`) carries the command's real exit code.",
+                 (`lotse: exit=<code> verdict=<command|network|interrupted> …`) carries the \
+                 command's real exit code and whose word it is.",
                 classes.join(", ")
             ),
         }
@@ -352,6 +377,28 @@ mod tests {
         assert_eq!(rw("echo `nix flake check`"), None);
         assert_eq!(rw("nix flake check; echo 'unbalanced"), None);
         assert_eq!(rw("nix flake check; echo $((1+2))"), None);
+        // ANSI-C quoting knows `\'`, and a parameter expansion may hold `;`
+        // and blanks: the four cases the audit's corpus found (CD-12).
+        assert_eq!(rw("echo $'x\\'; nix flake check #'"), None);
+        assert_eq!(
+            rw("V='; nix flake check!'; echo ${V#; nix flake check}"),
+            None
+        );
+        assert_eq!(rw("V='x'; echo ${V:+; nix flake check}"), None);
+        assert_eq!(rw("echo $'x\\'\nnix flake check #'"), None);
+        assert_eq!(
+            rw("git commit -m $'fix\\'; nix flake check #' --dry-run"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_class_name_is_one_shell_word_whatever_it_is() {
+        assert_eq!(shell_word("eval"), "eval");
+        assert_eq!(shell_word("a_b-9"), "a_b-9");
+        assert_eq!(shell_word("x; rm -rf ~ #"), "'x; rm -rf ~ #'");
+        assert_eq!(shell_word("it's"), "'it'\\''s'");
+        assert_eq!(shell_word(""), "''");
     }
 
     #[test]
@@ -392,7 +439,11 @@ mod tests {
         assert_eq!(hook["updatedInput"]["timeout"], 600000);
         assert_eq!(hook["updatedInput"]["description"], "gate");
         assert!(hook.get("permissionDecision").is_none());
-        assert!(hook["additionalContext"].as_str().unwrap().contains("201"));
+        let context = hook["additionalContext"].as_str().unwrap();
+        assert!(
+            context.contains("201") && context.contains("verdict="),
+            "{context}"
+        );
     }
 
     #[test]

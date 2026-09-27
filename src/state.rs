@@ -10,7 +10,7 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use rustix::fs::{FlockOperation, flock};
 use serde::{Deserialize, Serialize};
 
@@ -46,6 +46,53 @@ pub fn now() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
+/// What makes a state directory unfit: someone else owns it, or anyone but
+/// us may enter it. Whoever can write there can fake entries, hold the
+/// global lock, and read every queued command line.
+fn private_dir_problem(me: u32, uid: u32, mode: u32) -> Option<String> {
+    if uid != me {
+        return Some(format!("belongs to uid {uid}, not to us ({me})"));
+    }
+    if mode & 0o077 != 0 {
+        return Some(format!(
+            "has mode {:04o}, others may reach it (want 0700)",
+            mode & 0o7777
+        ));
+    }
+    None
+}
+
+/// Creates `dir` with mode 0700 if it is missing, and refuses it unless it
+/// is a real directory (no symlink), ours, and closed to everyone else.
+fn private_dir(dir: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    match fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => {
+            return Err(e).with_context(|| format!("cannot create {}", dir.display()));
+        }
+    }
+    let meta =
+        fs::symlink_metadata(dir).with_context(|| format!("cannot read {}", dir.display()))?;
+    if meta.file_type().is_symlink() {
+        bail!("{} is a symlink, not a directory of ours", dir.display());
+    }
+    if !meta.is_dir() {
+        bail!("{} is not a directory", dir.display());
+    }
+    let me = rustix::process::geteuid().as_raw();
+    if let Some(problem) = private_dir_problem(me, meta.uid(), meta.mode()) {
+        bail!("{} {problem}", dir.display());
+    }
+    Ok(())
+}
+
+/// Opened without following a symlink at the last component.
+fn nofollow() -> i32 {
+    rustix::fs::OFlags::NOFOLLOW.bits() as i32
+}
+
 pub struct StateDir {
     root: PathBuf,
 }
@@ -68,11 +115,14 @@ fn open_lock_file(path: &Path) -> std::io::Result<File> {
         .truncate(false)
         .write(true)
         .mode(0o600)
+        .custom_flags(nofollow())
         .open(path)
 }
 
 impl StateDir {
-    /// `$XDG_RUNTIME_DIR/lotse`, else `/tmp/lotse-<uid>`.
+    /// `$XDG_RUNTIME_DIR/lotse`, else `/tmp/lotse-<uid>`. Either way the
+    /// directory must be ours and closed to everybody else (`private_dir`):
+    /// under `/tmp` anyone could have created it first.
     pub fn open() -> Result<StateDir> {
         let root = match std::env::var_os("XDG_RUNTIME_DIR") {
             Some(dir) if !dir.is_empty() => PathBuf::from(dir).join("lotse"),
@@ -82,11 +132,15 @@ impl StateDir {
     }
 
     pub fn at(root: PathBuf) -> Result<StateDir> {
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(root.join("entries"))
-            .with_context(|| format!("cannot create the state directory {}", root.display()))?;
+        // Its parent ($XDG_RUNTIME_DIR, /tmp) is not ours to judge; the
+        // directory itself and everything in it are.
+        if let Some(parent) = root.parent().filter(|p| !p.as_os_str().is_empty()) {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("cannot create {}", parent.display()))?;
+        }
+        private_dir(&root)
+            .and_then(|()| private_dir(&root.join("entries")))
+            .with_context(|| format!("unusable state directory {}", root.display()))?;
         Ok(StateDir { root })
     }
 
@@ -109,8 +163,15 @@ impl StateDir {
             .ok()
             .and_then(|s| s.trim().parse().ok())
             .unwrap_or(0);
-        fs::write(&path, format!("{}\n", last + 1))
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .custom_flags(nofollow())
+            .open(&path)
             .with_context(|| format!("cannot write {}", path.display()))?;
+        writeln!(f, "{}", last + 1).with_context(|| format!("cannot write {}", path.display()))?;
         Ok(last + 1)
     }
 
@@ -163,7 +224,11 @@ impl StateDir {
                 continue;
             }
             let lock_path = json.with_extension("lock");
-            let alive = match OpenOptions::new().write(true).open(&lock_path) {
+            let alive = match OpenOptions::new()
+                .write(true)
+                .custom_flags(nofollow())
+                .open(&lock_path)
+            {
                 // Getting the lock means nobody holds it: the holder is dead.
                 // Our own entry is refused like anyone else's, because flock
                 // belongs to the open file description, not to the process.
@@ -191,7 +256,13 @@ impl StateDir {
 impl OwnedEntry {
     fn write(&mut self) -> Result<()> {
         let tmp = self.json.with_extension("tmp");
-        let mut f = File::create(&tmp)?;
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .custom_flags(nofollow())
+            .open(&tmp)?;
         f.write_all(&serde_json::to_vec(&self.entry)?)?;
         drop(f);
         fs::rename(&tmp, &self.json)?;
@@ -266,6 +337,51 @@ mod tests {
         assert_eq!(seen[0].class, "held");
         assert!(!json.exists());
         assert!(!json.with_extension("lock").exists());
+    }
+
+    #[test]
+    fn a_state_directory_others_can_reach_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        // What someone else could have prepared under /tmp (CD-11).
+        let tmp = tempfile::tempdir().unwrap();
+        let open = tmp.path().join("open");
+        fs::create_dir(&open).unwrap();
+        fs::set_permissions(&open, fs::Permissions::from_mode(0o777)).unwrap();
+        let err = StateDir::at(open)
+            .err()
+            .expect("a world-writable directory");
+        assert!(format!("{err:#}").contains("0777"), "{err:#}");
+
+        let real = tmp.path().join("real");
+        fs::create_dir(&real).unwrap();
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o700)).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let err = StateDir::at(link).err().expect("a symlink");
+        assert!(format!("{err:#}").contains("symlink"), "{err:#}");
+    }
+
+    #[test]
+    fn a_foreign_owner_is_refused() {
+        assert!(private_dir_problem(1000, 1000, 0o700).is_none());
+        assert!(private_dir_problem(1000, 0, 0o700).is_some());
+        assert!(private_dir_problem(1000, 1001, 0o700).is_some());
+        assert!(private_dir_problem(1000, 1000, 0o750).is_some());
+    }
+
+    #[test]
+    fn seq_is_not_written_through_a_symlink() {
+        let (tmp, state) = dir();
+        let victim = tmp.path().join("victim");
+        fs::write(&victim, "precious").unwrap();
+        std::os::unix::fs::symlink(&victim, tmp.path().join("lotse/seq")).unwrap();
+        let lock = state.lock().unwrap();
+        assert!(
+            state
+                .create(&lock, "a", None, Path::new("/"), &["true".to_string()])
+                .is_err()
+        );
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "precious");
     }
 
     #[test]
