@@ -22,5 +22,9 @@ toml = "0.8"
 [dev-dependencies]
 tempfile = "3"
 
+[lints.rust]
+# No `unsafe` anywhere in this crate, and no `#[allow]` can bring it back.
+unsafe_code = "forbid"
+
 [profile.release]
 lto = true

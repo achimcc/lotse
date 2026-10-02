@@ -2,9 +2,19 @@
   description = "Queue, admit and retry the heavy runs of parallel sessions on one workstation";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
+  # The RustSec advisory database, pinned like any other input. The `audit`
+  # check reads it offline; `nix flake update advisory-db` brings news in.
+  inputs.advisory-db = {
+    url = "github:rustsec/advisory-db";
+    flake = false;
+  };
 
   outputs =
-    { self, nixpkgs }:
+    {
+      self,
+      nixpkgs,
+      advisory-db,
+    }:
     let
       # /proc and flock(2): Linux only.
       systems = [
@@ -54,6 +64,22 @@
         in
         {
           inherit package;
+          # Known advisories against Cargo.lock, read offline from the pinned
+          # database.
+          audit = pkgs.runCommand "lotse-audit" { nativeBuildInputs = [ pkgs.cargo-audit ]; } ''
+            HOME=$TMPDIR cargo-audit audit --no-fetch --db ${advisory-db} --file ${./Cargo.lock}
+            touch $out
+          '';
+          # Bans, sources and licenses of the dependency tree (deny.toml).
+          # Inside the package's build environment: the vendored crates are
+          # what `cargo metadata` reads there, so nothing is fetched.
+          deny = package.overrideAttrs (old: {
+            pname = "lotse-deny";
+            nativeBuildInputs = old.nativeBuildInputs ++ [ pkgs.cargo-deny ];
+            buildPhase = "cargo deny --offline check bans sources licenses";
+            doCheck = false;
+            installPhase = "touch $out";
+          });
           clippy = package.overrideAttrs (old: {
             pname = "lotse-clippy";
             nativeBuildInputs = old.nativeBuildInputs ++ [ pkgs.clippy ];
