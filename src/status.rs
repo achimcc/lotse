@@ -17,6 +17,7 @@ struct Row {
     pid: u32,
     age: u64,
     rss: u64,
+    swap: u64,
     position: Option<usize>,
     command: String,
 }
@@ -40,6 +41,7 @@ fn rows(snap: &Snapshot, now: u64) -> Vec<Row> {
             pid: e.pid,
             age: now.saturating_sub(e.started.unwrap_or(e.created)),
             rss: snap.entry_rss(e),
+            swap: snap.entry_swap(e),
             position,
             command: e.command.join(" "),
         });
@@ -53,11 +55,16 @@ fn rows(snap: &Snapshot, now: u64) -> Vec<Row> {
             pid: o.pid,
             age: now.saturating_sub(o.start),
             rss: o.rss_tree,
+            swap: o.swap_tree,
             position: None,
             command: o.command.clone(),
         });
     }
     out
+}
+
+fn swapped(snap: &Snapshot, now: u64) -> u64 {
+    snap.active(now).iter().map(|a| a.swap_tree).sum()
 }
 
 fn pending_growth(cfg: &Config, snap: &Snapshot, now: u64) -> u64 {
@@ -76,6 +83,7 @@ pub fn render_json(cfg: &Config, snap: &Snapshot, now: u64) -> Value {
                 "pid": r.pid,
                 "age_s": r.age,
                 "rss": r.rss,
+                "swap": r.swap,
                 "memory": cfg.classes.get(&r.class).map_or(0, |c| c.memory),
                 "position": r.position,
                 "command": r.command,
@@ -86,6 +94,7 @@ pub fn render_json(cfg: &Config, snap: &Snapshot, now: u64) -> Value {
         "mem_available": snap.mem_available,
         "reserve": cfg.reserve,
         "pending_growth": pending_growth(cfg, snap, now),
+        "swapped": swapped(snap, now),
         "runs": runs,
     })
 }
@@ -106,7 +115,7 @@ pub fn render_text(cfg: &Config, snap: &Snapshot, now: u64) -> String {
     } else {
         out.push_str(&format!(
             "{:<9} {:<12} {:<8} {:<22} {:>7} {:>7} {:>13}  {}\n",
-            "STATE", "CLASS", "TARGET", "WORKTREE", "PID", "AGE", "RSS/ESTIMATE", "COMMAND"
+            "STATE", "CLASS", "TARGET", "WORKTREE", "PID", "AGE", "MEM/ESTIMATE", "COMMAND"
         ));
         for r in &rows {
             let state = match r.position {
@@ -114,10 +123,13 @@ pub fn render_text(cfg: &Config, snap: &Snapshot, now: u64) -> String {
                 None => r.state.to_string(),
             };
             let memory = cfg.classes.get(&r.class).map_or(0, |c| c.memory);
+            // Resident and swapped together: a run that was pushed out is
+            // not small, it is merely elsewhere.
+            let held = r.rss.saturating_add(r.swap);
             let rss = if memory > 0 {
-                format!("{}/{}", format_size(r.rss), format_size(memory))
+                format!("{}/{}", format_size(held), format_size(memory))
             } else {
-                format_size(r.rss)
+                format_size(held)
             };
             out.push_str(&format!(
                 "{:<9} {:<12} {:<8} {:<22} {:>7} {:>7} {:>13}  {}\n",
@@ -133,10 +145,11 @@ pub fn render_text(cfg: &Config, snap: &Snapshot, now: u64) -> String {
         }
     }
     out.push_str(&format!(
-        "memory: {} available, {} reserve, {} still to be claimed by running jobs\n",
+        "memory: {} available, {} reserve, {} still to be claimed by running jobs, {} of theirs in swap\n",
         format_size(snap.mem_available),
         format_size(cfg.reserve),
         format_size(pending_growth(cfg, snap, now)),
+        format_size(swapped(snap, now)),
     ));
     out
 }
@@ -177,6 +190,7 @@ mod tests {
                 cwd: None,
                 start: 40,
                 rss_tree: 5,
+                swap_tree: 7,
                 command: "colmena apply --on vps".into(),
             }],
             table: ProcTable::new(Vec::new()),
@@ -191,6 +205,8 @@ mod tests {
         assert_eq!(runs[2]["worktree"], "wt");
         assert_eq!(runs[3]["state"], "observed");
         assert_eq!(runs[3]["age_s"], 60);
+        assert_eq!((&runs[3]["rss"], &runs[3]["swap"]), (&json!(5), &json!(7)));
+        assert_eq!(v["swapped"], 7);
         // One running eval that has not grown yet: its whole estimate is pending.
         assert_eq!(v["pending_growth"], 10u64 << 30);
         assert!(render_text(&cfg, &snap, 100).contains("wait #2"));

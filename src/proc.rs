@@ -14,6 +14,9 @@ pub struct Proc {
     pub ppid: u32,
     /// Resident set, bytes.
     pub rss: u64,
+    /// What the kernel has moved to swap, bytes. Missing from the resident
+    /// set and from nobody's `MemAvailable`, yet still this process's memory.
+    pub swap: u64,
     /// Seconds since the epoch.
     pub start: u64,
     pub argv: Vec<String>,
@@ -45,6 +48,14 @@ fn boot_time() -> u64 {
         .unwrap_or(0)
 }
 
+/// `VmSwap` out of `/proc/<pid>/status`, in kB as the kernel prints it.
+fn vm_swap_kb(status: &str) -> Option<u64> {
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("VmSwap:"))
+        .and_then(|v| v.trim().trim_end_matches("kB").trim().parse().ok())
+}
+
 fn read_proc(pid: u32, uid: u32, boot: u64, page: u64) -> Option<Proc> {
     let dir = format!("/proc/{pid}");
     if fs::metadata(&dir).ok()?.uid() != uid {
@@ -60,6 +71,11 @@ fn read_proc(pid: u32, uid: u32, boot: u64, page: u64) -> Option<Proc> {
     let ticks: u64 = fields.get(19)?.parse().ok()?;
     let statm = fs::read_to_string(format!("{dir}/statm")).ok()?;
     let pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
+    // `statm` has no swap column. A kernel thread has no `VmSwap` line.
+    let swap_kb = fs::read_to_string(format!("{dir}/status"))
+        .ok()
+        .and_then(|s| vm_swap_kb(&s))
+        .unwrap_or(0);
     let cmdline = fs::read(format!("{dir}/cmdline")).ok()?;
     let argv = cmdline
         .split(|b| *b == 0)
@@ -70,6 +86,7 @@ fn read_proc(pid: u32, uid: u32, boot: u64, page: u64) -> Option<Proc> {
         pid,
         ppid,
         rss: pages * page,
+        swap: swap_kb * 1024,
         start: boot + ticks / TICKS_PER_SECOND,
         argv,
         cwd: fs::read_link(format!("{dir}/cwd")).ok(),
@@ -144,6 +161,17 @@ impl ProcTable {
             .sum()
     }
 
+    /// What the tree holds in swap. A run that was pushed out looks small in
+    /// `tree_rss` and leaves `MemAvailable` high, but it faults every page
+    /// back in as soon as it goes on.
+    pub fn tree_swap(&self, pid: u32) -> u64 {
+        self.subtree(pid)
+            .iter()
+            .filter_map(|p| self.by_pid.get(p))
+            .map(|p| p.swap)
+            .sum()
+    }
+
     fn ancestors(&self, pid: u32) -> Vec<u32> {
         let mut out = Vec::new();
         let mut cur = pid;
@@ -166,6 +194,7 @@ pub struct Observed {
     pub cwd: Option<PathBuf>,
     pub start: u64,
     pub rss_tree: u64,
+    pub swap_tree: u64,
     pub command: String,
 }
 
@@ -259,6 +288,7 @@ pub fn observe(cfg: &Config, table: &ProcTable, registered: &[u32]) -> Vec<Obser
             cwd: p.cwd.clone(),
             start: p.start,
             rss_tree: table.tree_rss(pid),
+            swap_tree: table.tree_swap(pid),
             command: p.argv.join(" "),
         });
     }
@@ -422,5 +452,19 @@ mod tests {
         assert!(mine.start > 1_600_000_000, "start {}", mine.start);
         assert!(!mine.argv.is_empty());
         assert!(RealProc.mem_available() > 0);
+    }
+
+    #[test]
+    fn swap_is_read_from_status_and_summed_over_the_tree() {
+        let status = "Name:\tnix\nVmRSS:\t 4985756 kB\nVmSwap:\t12366092 kB\nThreads:\t9\n";
+        assert_eq!(vm_swap_kb(status), Some(12_366_092));
+        assert_eq!(vm_swap_kb("Name:\tkthreadd\n"), None);
+        let mut parent = p(9, 1, 2, &["timeout", "600"]);
+        parent.swap = 3;
+        let mut child = p(10, 9, 5, NIX);
+        child.swap = 4;
+        let t = ProcTable::new(vec![parent, child]);
+        assert_eq!((t.tree_rss(9), t.tree_swap(9)), (7, 7));
+        assert_eq!(observe(&cfg(), &t, &[])[0].swap_tree, 4);
     }
 }

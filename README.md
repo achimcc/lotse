@@ -16,14 +16,14 @@ restarted the DNS, reads exactly like a failed check.
 
 ```console
 $ lotse status
-STATE     CLASS   TARGET  WORKTREE     PID      AGE    RSS/ESTIMATE  COMMAND
+STATE     CLASS   TARGET  WORKTREE     PID      AGE    MEM/ESTIMATE  COMMAND
 running   eval    -       audit-b12    3672958  3m04s  12.0G/12.0G   nix eval --raw .#nixosConfigurations.server.config…
 observed  eval    server  dispatcharr  3683961  1m31s   5.7G/12.0G   colmena apply --on server build --keep-result
 wait #1   eval    -       rust-ideen   3688102    12s     0K/12.0G   nix build .#nixosConfigurations.server.config.sys…
-memory: 7.2G available, 4.0G reserve, 6.3G still to be claimed by running jobs
+memory: 7.2G available, 4.0G reserve, 6.3G still to be claimed by running jobs, 0K of theirs in swap
 
 $ lotse run --class eval -- nix build .#nixosConfigurations.server.config.system.build.toplevel
-lotse: waiting: memory: need 16.0G including the reserve, 0.9G left after what running jobs will still grow
+lotse: waiting: memory: need 16.0G including the reserve, 0.9G left after what running jobs will still grow or take back from swap
 …
 lotse: exit=0 verdict=command attempts=1 waited=252s ran=431s log=/home/me/.local/state/lotse/logs/20260919-123816-00000007-3688102.log
 ```
@@ -110,8 +110,8 @@ Decided under a short global lock, in this order:
 4. **Memory:**
 
    ```
-   MemAvailable − Σ max(0, estimate − resident)  ≥  estimate of the new run + reserve
-                  over everything under way
+   MemAvailable − Σ max(0, estimate − held) − Σ swapped  ≥  estimate of the new run + reserve
+                  over everything under way         held = resident + swapped
    ```
 
    A run that has just started is small but will grow to its estimate; one
@@ -120,6 +120,15 @@ Decided under a short global lock, in this order:
    evaluation is over and that only waits for the builders is small and
    will stay so. Counting both as
    "one slot" is what fills a machine.
+
+   What a run holds in swap is subtracted as well. The kernel made
+   `MemAvailable` by pushing that run out, and the run takes every page
+   back as it goes on: a run with 5G resident and 12G in swap is a 17G run.
+   Reading the resident set alone, lotse once admitted three evaluations
+   side by side on a 30G machine, and all three spent their time swapping.
+   Only the swap of runs under way counts, not the swap of the machine: a
+   browser tab pushed out days ago asks for nothing. `MEM` in `lotse status`
+   is resident and swapped together.
 
    If the budget says no while nothing at all is under way, the run starts
    anyway, with a warning: it would be waiting for memory nobody is going to

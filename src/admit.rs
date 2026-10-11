@@ -16,6 +16,8 @@ pub struct Active {
     pub target: Option<String>,
     /// Resident set of the whole process tree, bytes.
     pub rss_tree: u64,
+    /// What that tree holds in swap, bytes.
+    pub swap_tree: u64,
     /// Seconds since it started.
     pub age: u64,
     pub label: String,
@@ -30,7 +32,13 @@ impl Active {
         if class.grows_for.is_some_and(|g| self.age >= g.as_secs()) {
             return 0;
         }
-        class.memory.saturating_sub(self.rss_tree)
+        class.memory.saturating_sub(self.footprint())
+    }
+
+    /// Resident and swapped together: what the run has grown to, wherever
+    /// the kernel keeps it at the moment.
+    pub fn footprint(&self) -> u64 {
+        self.rss_tree.saturating_add(self.swap_tree)
     }
 }
 
@@ -73,7 +81,7 @@ impl std::fmt::Display for Reason {
             }
             Reason::Memory { need, have } => write!(
                 f,
-                "memory: need {} including the reserve, {} left after what running jobs will still grow",
+                "memory: need {} including the reserve, {} left after what running jobs will still grow or take back from swap",
                 format_size(*need),
                 format_size(*have)
             ),
@@ -144,7 +152,14 @@ pub fn decide(
         // A run that has just started is still small but will grow to its
         // estimate; one that has grown is already missing from MemAvailable.
         let pending: u64 = active.iter().map(|a| a.pending(cfg)).sum();
-        let have = mem_available.saturating_sub(pending);
+        // What a running job holds in swap is NOT missing from MemAvailable:
+        // the kernel made that room by pushing the job out, and the job
+        // takes it back page by page. Three evaluations once ran side by
+        // side this way, each showing 5G resident and 12G in swap.
+        let swapped: u64 = active.iter().map(|a| a.swap_tree).sum();
+        let have = mem_available
+            .saturating_sub(pending)
+            .saturating_sub(swapped);
         let need = class.memory + cfg.reserve;
         if need > have {
             if active.is_empty() {
@@ -181,6 +196,7 @@ mod tests {
             class: class.into(),
             target: target.map(Into::into),
             rss_tree: rss,
+            swap_tree: 0,
             age: 10,
             label: format!("{class} {}", target.unwrap_or("-")),
         }
@@ -298,6 +314,46 @@ mod tests {
     fn a_grown_run_is_already_in_mem_available() {
         let grown = [active("eval", None, 10 * G)];
         assert_eq!(decide(&cfg(), &cand("eval", None), &grown, &[], 20 * G), OK);
+    }
+
+    #[test]
+    fn a_swapped_out_run_still_owns_what_it_swapped() {
+        // 5G resident, 12G in swap: grown past its estimate, so nothing is
+        // pending, and MemAvailable looks roomy because the run was pushed out.
+        let mut pushed_out = active("eval", None, 5 * G);
+        pushed_out.swap_tree = 12 * G;
+        assert_eq!(pushed_out.pending(&cfg()), 0);
+        assert_eq!(
+            decide(
+                &cfg(),
+                &cand("eval", None),
+                &[pushed_out.clone()],
+                &[],
+                20 * G
+            ),
+            Decision::Wait(Reason::Memory {
+                need: 14 * G,
+                have: 8 * G
+            })
+        );
+        // Enough room even after it has taken everything back.
+        assert_eq!(
+            decide(&cfg(), &cand("eval", None), &[pushed_out], &[], 26 * G),
+            OK
+        );
+    }
+
+    #[test]
+    fn swap_counts_towards_the_estimate_only_once() {
+        // 2G resident and 3G swapped of a 10G estimate: 5G still to grow,
+        // 3G to take back. Not 8G pending plus 3G swapped.
+        let mut young = active("eval", None, 2 * G);
+        young.swap_tree = 3 * G;
+        assert_eq!(young.pending(&cfg()), 5 * G);
+        assert_eq!(
+            decide(&cfg(), &cand("eval", None), &[young], &[], 22 * G),
+            OK
+        );
     }
 
     #[test]

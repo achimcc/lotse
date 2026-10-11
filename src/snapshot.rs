@@ -64,6 +64,11 @@ impl Snapshot {
         e.child_pid.map_or(0, |pid| self.table.tree_rss(pid))
     }
 
+    /// What an entry's tree holds in swap.
+    pub fn entry_swap(&self, e: &Entry) -> u64 {
+        e.child_pid.map_or(0, |pid| self.table.tree_swap(pid))
+    }
+
     pub fn active(&self, now: u64) -> Vec<Active> {
         let running = self
             .entries
@@ -73,6 +78,7 @@ impl Snapshot {
                 class: e.class.clone(),
                 target: e.target.clone(),
                 rss_tree: self.entry_rss(e),
+                swap_tree: self.entry_swap(e),
                 age: now.saturating_sub(e.started.unwrap_or(e.created)),
                 label: label(&e.class, e.target.as_deref(), Some(&e.cwd), e.pid),
             });
@@ -80,6 +86,7 @@ impl Snapshot {
             class: o.class.clone(),
             target: o.target.clone(),
             rss_tree: o.rss_tree,
+            swap_tree: o.swap_tree,
             age: now.saturating_sub(o.start),
             label: format!(
                 "{}, not registered",
