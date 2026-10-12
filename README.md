@@ -91,6 +91,7 @@ typo in a limit must not silently select the default.
 | `class.X.slots` | how many at once; without it only the memory budget limits |
 | `class.X.per_target` | slots and queue count per `--target` |
 | `class.X.exclusive_with` | classes that must not run at the same time, in both directions |
+| `class.X.priority` | a budgeted run waits while a run of a class with a higher priority waits for memory alone (default `0`) |
 | `class.X.observe` | command lines that are a run of this class even unregistered |
 | `class.X.ignore` | command lines that match `observe` and still are not |
 | `class.X.wrap` | `lotse hook claude` puts `lotse run` in front of commands of this class |
@@ -107,7 +108,12 @@ Decided under a short global lock, in this order:
    an exclusive run starves while the class it excludes keeps arriving.
 2. **Slots** of the class. Observed runs hold slots like registered ones.
 3. **Exclusion.**
-4. **Memory:**
+4. **Priority.** A budgeted run is held back while a run of a class with a
+   higher `priority` waits and memory is all it waits for. Otherwise a big
+   run starves behind small ones: whenever one of them ends, the next takes
+   the room before enough has gathered. A waiter that is behind a slot or an
+   exclusion holds nobody back — it could not start anyway.
+5. **Memory:**
 
    ```
    MemAvailable − Σ max(0, estimate − held) − Σ swapped  ≥  estimate of the new run + reserve

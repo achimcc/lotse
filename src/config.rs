@@ -35,6 +35,9 @@ pub struct Class {
     /// Slots and queue count per `--target` instead of per class.
     pub per_target: bool,
     pub exclusive_with: Vec<String>,
+    /// A budgeted run is not admitted while a run of a class with a higher
+    /// priority waits for memory alone. Default 0.
+    pub priority: i32,
     /// Command lines that are a run of this class even if nobody registered it.
     pub observe: Vec<Regex>,
     /// Command lines that match `observe` and are still not of this class.
@@ -73,6 +76,8 @@ struct RawClass {
     per_target: bool,
     #[serde(default)]
     exclusive_with: Vec<String>,
+    #[serde(default)]
+    priority: i32,
     #[serde(default)]
     observe: Vec<String>,
     #[serde(default)]
@@ -206,6 +211,7 @@ impl Config {
                     slots: c.slots,
                     per_target: c.per_target,
                     exclusive_with: c.exclusive_with.clone(),
+                    priority: c.priority,
                     observe: patterns(&c.observe, &format!("class {name}, observe"))?,
                     ignore: patterns(&c.ignore, &format!("class {name}, ignore"))?,
                     wrap: c.wrap,

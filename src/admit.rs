@@ -65,6 +65,7 @@ pub enum Reason {
     Queue { ahead: String },
     Slots { class: String, holders: Vec<String> },
     Exclusive { with: String, holder: String },
+    Priority { ahead: String },
     Memory { need: u64, have: u64 },
 }
 
@@ -78,6 +79,9 @@ impl std::fmt::Display for Reason {
             }
             Reason::Exclusive { with, holder } => {
                 write!(f, "excluded by class {with}: {holder}")
+            }
+            Reason::Priority { ahead } => {
+                write!(f, "yielding memory to {ahead}, which has priority")
             }
             Reason::Memory { need, have } => write!(
                 f,
@@ -149,6 +153,27 @@ pub fn decide(
     }
 
     if class.memory > 0 {
+        // Yield to a waiter of a class with a higher priority — but only to
+        // one that memory alone holds back. Without this a big run starves
+        // behind small ones: every time one of them ends, the next takes the
+        // room before enough has gathered. A waiter that is behind a slot or
+        // an exclusion could not start anyway, and holding everyone back
+        // for it would only idle the machine.
+        if let Some(ahead) = queued
+            .iter()
+            .filter(|q| {
+                cfg.classes
+                    .get(&q.class)
+                    .is_some_and(|qc| qc.priority > class.priority && qc.memory > 0)
+                    && memory_is_all_it_waits_for(cfg, q, active, queued)
+            })
+            .min_by_key(|q| q.seq)
+        {
+            return Decision::Wait(Reason::Priority {
+                ahead: ahead.label.clone(),
+            });
+        }
+
         // A run that has just started is still small but will grow to its
         // estimate; one that has grown is already missing from MemAvailable.
         let pending: u64 = active.iter().map(|a| a.pending(cfg)).sum();
@@ -170,6 +195,30 @@ pub fn decide(
     }
 
     Decision::Admit { starved: false }
+}
+
+/// Would this waiter start at once if memory were no question? The answer
+/// recurses only into classes of a still higher priority, so it ends.
+fn memory_is_all_it_waits_for(
+    cfg: &Config,
+    waiter: &Queued,
+    active: &[Active],
+    queued: &[Queued],
+) -> bool {
+    let cand = Candidate {
+        seq: waiter.seq,
+        class: &waiter.class,
+        target: waiter.target.as_deref(),
+    };
+    let others: Vec<Queued> = queued
+        .iter()
+        .filter(|q| q.seq != waiter.seq)
+        .cloned()
+        .collect();
+    matches!(
+        decide(cfg, &cand, active, &others, u64::MAX),
+        Decision::Admit { .. }
+    )
 }
 
 #[cfg(test)]
@@ -372,6 +421,93 @@ mod tests {
         assert_eq!(
             decide(&cfg(), &cand("eval", None), &[], &[], 8 * G),
             Decision::Admit { starved: true }
+        );
+    }
+
+    /// Small runs and a big one that goes first, both budgeted.
+    fn cfg_with_priority() -> Config {
+        Config::parse(
+            r#"
+reserve = "4G"
+
+[class.eval]
+memory = "10G"
+slots = 3
+
+[class.deploy]
+memory = "12G"
+per_target = true
+slots = 1
+priority = 10
+"#,
+        )
+        .unwrap()
+    }
+
+    fn queued_on(seq: u64, class: &str, target: &str) -> Queued {
+        Queued {
+            seq,
+            class: class.into(),
+            target: Some(target.into()),
+            label: format!("{class} {target} #{seq}"),
+        }
+    }
+
+    #[test]
+    fn a_small_run_yields_to_a_waiter_with_priority() {
+        // One evaluation runs, 20G are free: room for another evaluation
+        // (14G) but the waiting deploy needs 16G and would never get them
+        // if evaluations kept arriving. It arrived LATER and still goes first.
+        let c = cfg_with_priority();
+        let running = [active("eval", None, 10 * G)];
+        let waiting = [queued_on(11, "deploy", "server")];
+        assert_eq!(
+            decide(&c, &cand("eval", None), &running, &waiting, 14 * G),
+            Decision::Wait(Reason::Priority {
+                ahead: "deploy server #11".into()
+            })
+        );
+        // Without the waiter the same evaluation starts.
+        assert_eq!(decide(&c, &cand("eval", None), &running, &[], 14 * G), OK);
+    }
+
+    #[test]
+    fn nobody_yields_to_a_waiter_that_could_not_start_anyway() {
+        // The waiting deploy is behind a running deploy of its own target:
+        // its slot is taken, memory is not what holds it back.
+        let c = cfg_with_priority();
+        let running = [active("deploy", Some("server"), 12 * G)];
+        let waiting = [queued_on(11, "deploy", "server")];
+        assert_eq!(
+            decide(&c, &cand("eval", None), &running, &waiting, 20 * G),
+            OK
+        );
+        // Nor to the second in line: the first one is what it waits for.
+        let two = [
+            queued_on(11, "deploy", "server"),
+            queued_on(12, "deploy", "server"),
+        ];
+        match decide(&c, &cand("eval", None), &[], &two, 20 * G) {
+            Decision::Wait(Reason::Priority { ahead }) => assert_eq!(ahead, "deploy server #11"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn priority_is_one_way_and_spares_unbudgeted_runs() {
+        let c = cfg_with_priority();
+        // The deploy does not yield to a waiting evaluation.
+        let waiting = [queued(3, "eval")];
+        assert_eq!(
+            decide(&c, &cand("deploy", Some("server")), &[], &waiting, 64 * G),
+            OK
+        );
+        // In the example nothing has a priority and deploys are unbudgeted:
+        // an evaluation passes a waiting deploy as before.
+        let waiting = [queued_on(3, "deploy", "server")];
+        assert_eq!(
+            decide(&cfg(), &cand("eval", None), &[], &waiting, 64 * G),
+            OK
         );
     }
 

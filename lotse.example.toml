@@ -37,6 +37,11 @@ retry = { patterns = ['Could not resolve host', 'unable to download', 'daemon di
 [class.deploy]
 per_target = true
 slots = 1
+# With a `memory` estimate of its own, a deploy can starve behind evaluations
+# that keep arriving. `priority` above theirs makes them wait while a deploy
+# waits for memory alone:
+#   memory = "12G"
+#   priority = 10
 observe = ['^(\S*/)?colmena apply\b']
 # `colmena apply build` builds and activates nothing: an eval, not a deploy.
 ignore = ['\bcolmena apply\b.* (build|dry-activate)\b']
